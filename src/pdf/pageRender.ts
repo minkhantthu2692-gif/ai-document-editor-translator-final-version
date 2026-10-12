@@ -4,9 +4,11 @@
  * Both go through pdf.js onto an `OffscreenCanvas` inside the analysis worker,
  * so the main thread never touches pixels. The background render starts from a
  * normal page image and then *masks the text away*: for every text run we
- * sample the colours on a thin ring just outside its box (median over the four
- * sides) and repaint the box with them. Images and vector graphics outside the
- * boxes are untouched, which is exactly what the translated text overlay needs.
+ * sample the colours on a thin ring just outside its box (the median of each
+ * side) and repaint the box with those colours blended per pixel, so the patch
+ * continues into the ring instead of ending in a hard edge. Images and vector
+ * graphics outside the boxes are untouched, which is exactly what the
+ * translated text overlay needs.
  * Pages whose text lives only in the image (scanned, OCR) have no runs at all,
  * so the caller can hand in stored block boxes as erase geometry — `planErase`
  * decides what is actually painted.
@@ -174,9 +176,12 @@ async function textBoxes(
     if (str.trim().length === 0 || !raw.transform || !Number.isFinite(raw.width)) continue
 
     const [, , , , originX, originY] = raw.transform
-    const width = Math.max(0, raw.width ?? 0)
     const fontSize = Math.max(1, raw.height ?? Math.abs(raw.transform[3]) ?? 10)
-    if (width <= 0.5) continue
+    // A run with degenerate width metrics still paints pixels — estimate its
+    // extent instead of skipping it, or stray source glyphs stay visible
+    // under the translation (L-10).
+    const width = runExtent(str, fontSize, Math.max(0, raw.width ?? 0))
+    if (width < 0.5) continue
 
     // Baseline origin → the visual box: roughly one em above, a quarter below.
     const [x0, y0] = viewport.convertToViewportPoint(originX, originY - fontSize * 0.28)
@@ -195,6 +200,125 @@ function median(values: number[]): number {
   if (values.length === 0) return 255
   const sorted = [...values].sort((a, b) => a - b)
   return sorted[Math.floor(sorted.length / 2)]
+}
+
+/** An opaque [r, g, b] colour, 0..255 per channel. */
+export type Rgba = readonly [number, number, number]
+
+/** Ring samples for one side of a box, split by channel. */
+export interface RingSamples {
+  r: number[]
+  g: number[]
+  b: number[]
+}
+
+/**
+ * Median colour of one ring side; `null` when the side produced no samples
+ * (fully transparent, off-canvas, or unreadable).
+ */
+export function medianColor(samples: RingSamples): Rgba | null {
+  if (samples.r.length === 0) return null
+  return [median(samples.r), median(samples.g), median(samples.b)]
+}
+
+/** The four side medians a repaint is painted from. */
+export interface RingSides {
+  top: Rgba
+  bottom: Rgba
+  left: Rgba
+  right: Rgba
+}
+
+/**
+ * Fills in the sides a box could not sample — a box touching the canvas edge
+ * has no ring on that side — with the mean of the sides that did sample, so
+ * the patch still continues into whatever surrounds it. `null` only when
+ * nothing opaque was found at all; the caller keeps its white-fill fallback.
+ */
+export function resolveRingSides(sides: {
+  top: Rgba | null
+  bottom: Rgba | null
+  left: Rgba | null
+  right: Rgba | null
+}): RingSides | null {
+  const known = [sides.top, sides.bottom, sides.left, sides.right].filter(
+    (side): side is Rgba => side !== null,
+  )
+  if (known.length === 0) return null
+  const mean: Rgba = [
+    Math.round(known.reduce((sum, c) => sum + c[0], 0) / known.length),
+    Math.round(known.reduce((sum, c) => sum + c[1], 0) / known.length),
+    Math.round(known.reduce((sum, c) => sum + c[2], 0) / known.length),
+  ]
+  return {
+    top: sides.top ?? mean,
+    bottom: sides.bottom ?? mean,
+    left: sides.left ?? mean,
+    right: sides.right ?? mean,
+  }
+}
+
+/** The box's four corner colours for the blend (see `blendCorners`). */
+export interface BlendCorners {
+  tl: Rgba
+  tr: Rgba
+  bl: Rgba
+  br: Rgba
+}
+
+/**
+ * Corner colours for the per-pixel blend: each corner is the mean of the two
+ * sides meeting there, so every edge of the box starts at exactly its own
+ * side's median — the patch continues into the ring instead of ending in the
+ * hard rectangle edge that used to show on gradients and figures (L-07).
+ *
+ * A ring whose four medians are equal — every normal paper background — makes
+ * all four corners that same colour, so the paint degenerates to the old flat
+ * fill exactly: one code path, no variance threshold to get wrong.
+ */
+export function blendCorners(sides: RingSides): BlendCorners {
+  const mix = (a: Rgba, b: Rgba): Rgba => [
+    Math.round((a[0] + b[0]) / 2),
+    Math.round((a[1] + b[1]) / 2),
+    Math.round((a[2] + b[2]) / 2),
+  ]
+  return {
+    tl: mix(sides.top, sides.left),
+    tr: mix(sides.top, sides.right),
+    bl: mix(sides.bottom, sides.left),
+    br: mix(sides.bottom, sides.right),
+  }
+}
+
+/**
+ * Colour at `(u, v)` inside the box, `u` across and `v` down, both 0..1
+ * (clamped). Bilinear across the four corner colours.
+ */
+export function blendAt(corners: BlendCorners, u: number, v: number): Rgba {
+  const uu = u <= 0 ? 0 : u >= 1 ? 1 : u
+  const vv = v <= 0 ? 0 : v >= 1 ? 1 : v
+  const lerp = (a: number, b: number, t: number): number => a + (b - a) * t
+  const channel = (i: number): number =>
+    Math.round(lerp(lerp(corners.tl[i], corners.tr[i], uu), lerp(corners.bl[i], corners.br[i], uu), vv))
+  return [channel(0), channel(1), channel(2)]
+}
+
+/**
+ * Width in PDF units of a text run the mask should cover (L-10).
+ *
+ * A run whose metrics came back degenerate — width 0 or a fraction of a point
+ * for glyphs that are visibly there — still paints pixels; skipping it used
+ * to leave stray source characters under the translation. Estimate the extent
+ * from the font size instead: ~0.75 em per glyph balances the typical Latin
+ * advance (~0.5 em) against full-width and stacked scripts (~1 em), and
+ * over-covering is safe because the box is repainted from its ring, while
+ * under-covering is exactly the bug. Only callers with no estimate possible
+ * (blank strings — filtered before this is reached) may still skip.
+ */
+export function runExtent(str: string, fontSize: number, reportedWidth: number): number {
+  if (reportedWidth > 0.5) return reportedWidth
+  const glyphs = Math.max(1, str.trim().length)
+  return fontSize * glyphs * 0.75
 }
 
 /** A rectangle in viewport pixels, top-left origin. */
@@ -305,8 +429,12 @@ export function storedEraseBoxes(
 }
 
 /**
- * Repaints one box with the median colour of a ring 2 px outside it.
- * Falls back to white when the ring cannot be read (fully transparent edges).
+ * Repaints one box from the median colour of each ring side, blended per
+ * pixel (see `blendCorners`/`blendAt`): text over paper repaints as the flat
+ * colour it always did, while text over a gradient or a figure repaints with
+ * the colours that surround each edge rather than one average — so the patch
+ * no longer ends in a visible rectangle (L-07). Falls back to white when the
+ * ring cannot be read at all (fully transparent edges).
  */
 function inpaintBox(
   context: MaskableContext,
@@ -319,20 +447,23 @@ function inpaintBox(
   const height = Math.ceil(box.h)
   if (width <= 0 || height <= 0) return
 
-  const reds: number[] = []
-  const greens: number[] = []
-  const blues: number[] = []
+  const samples: Record<'top' | 'bottom' | 'left' | 'right', RingSamples> = {
+    top: { r: [], g: [], b: [] },
+    bottom: { r: [], g: [], b: [] },
+    left: { r: [], g: [], b: [] },
+    right: { r: [], g: [], b: [] },
+  }
   const step = 4
 
-  const sample = (x: number, y: number): void => {
+  const sample = (side: keyof typeof samples, x: number, y: number): void => {
     if (x < 0 || y < 0) return
     try {
       const pixel = context.getImageData(x, y, 1, 1).data
       // Skip transparent pixels — they are page background, not ink.
       if (pixel[3] < 8) return
-      reds.push(pixel[0])
-      greens.push(pixel[1])
-      blues.push(pixel[2])
+      samples[side].r.push(pixel[0])
+      samples[side].g.push(pixel[1])
+      samples[side].b.push(pixel[2])
     } catch {
       // getImageData can throw on tainted canvases; ignore.
     }
@@ -341,17 +472,52 @@ function inpaintBox(
   const right = left + width
   const bottom = top + height
   for (let x = left; x <= right; x += step) {
-    sample(x, top - margin)
-    sample(x, bottom + margin)
+    sample('top', x, top - margin)
+    sample('bottom', x, bottom + margin)
   }
   for (let y = top; y <= bottom; y += step) {
-    sample(left - margin, y)
-    sample(right + margin, y)
+    sample('left', left - margin, y)
+    sample('right', right + margin, y)
   }
 
-  const fill = `rgb(${median(reds)}, ${median(greens)}, ${median(blues)})`
-  context.fillStyle = fill
-  context.fillRect(left, top, width, height)
+  const ring = resolveRingSides({
+    top: medianColor(samples.top),
+    bottom: medianColor(samples.bottom),
+    left: medianColor(samples.left),
+    right: medianColor(samples.right),
+  })
+  if (!ring) {
+    context.fillStyle = 'rgb(255, 255, 255)'
+    context.fillRect(left, top, width, height)
+    return
+  }
+  const corners = blendCorners(ring)
+
+  let region: ImageData | null = null
+  try {
+    region = context.getImageData(left, top, width, height)
+  } catch {
+    // Tainted canvas: fall back to the flat centre colour of the blend.
+    const mid = blendAt(corners, 0.5, 0.5)
+    context.fillStyle = `rgb(${mid[0]}, ${mid[1]}, ${mid[2]})`
+    context.fillRect(left, top, width, height)
+    return
+  }
+
+  const buffer = region.data
+  for (let row = 0; row < height; row++) {
+    const v = height > 1 ? row / (height - 1) : 0
+    for (let col = 0; col < width; col++) {
+      const u = width > 1 ? col / (width - 1) : 0
+      const [r, g, b] = blendAt(corners, u, v)
+      const offset = (row * width + col) * 4
+      buffer[offset] = r
+      buffer[offset + 1] = g
+      buffer[offset + 2] = b
+      buffer[offset + 3] = 255
+    }
+  }
+  context.putImageData(region, left, top)
 }
 
 /** Starts rendering one page; call `cancel()` to abort a stale request. */
