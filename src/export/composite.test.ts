@@ -444,6 +444,20 @@ describe('compositePage clamping (adjustLayout off)', () => {
     })
     expect(flagsPainted()).toEqual([])
   })
+
+  it('shrinks to the 6pt floor and never below it', async () => {
+    // FIT_MIN_SIZE is the only shrink the pipeline has: auto-fit may search
+    // below it but reports `fits: false` at the floor instead, so the paint
+    // uses that floor — this pins the raster path to the same contract the
+    // editor and the HTML export honour (PHASE-03 req. 5).
+    await compositePage(page([block({ translatedText: words(40) })]), null, {
+      scale: 1,
+      fontStack: '',
+    })
+    const font = canvases[0].context.font // the page canvas, not the measurer's 1×1
+    expect(font).toContain('6px')
+    expect(font).not.toMatch(/\b[1-5]px\b/)
+  })
 })
 
 describe('workerMeasurer', () => {
