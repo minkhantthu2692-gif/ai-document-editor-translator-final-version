@@ -1,0 +1,480 @@
+# Large-Document Translation Architecture
+
+**Status:** Phases **A** (§5.1) and **B** (§5.2) are **implemented and shipped**.
+Phases C and D are design only. Nothing in any phase makes a provider switch or a
+local LLM load-bearing — chunking, queueing, retrying and key scheduling are the
+mechanism.
+**Scope:** how a large document is split, budgeted, scheduled, retried and re-merged.
+**Non-goals:** switching provider/model as a *solution* to size, or requiring a local LLM. Those remain optional *user choices*, never the mechanism that makes a large file work.
+
+---
+
+## 1. What exists today (and what is actually broken)
+
+The pipeline is already structurally sound. These parts are **not** the problem and should be kept:
+
+| Layer | Where | Why it is good |
+|---|---|---|
+| Durable queue | `core/jobQueue.ts` + `translate/translateQueue.ts:319-333` | Snapshot persisted to `translate.run.<projectId>` after **every** settled batch. |
+| Idempotent resume | `translateQueue.ts:928-960` (`restoreTranslate`) | Re-plans from **Dexie block state**, not the snapshot. `classifyBlock` (158-165) drops `translated`/`edited`, so re-running never re-translates. Restart-safe by construction. |
+| Per-block merge | `translateQueue.ts:484-545` (`persistLines`) | Writes `block.translatedText` per block. The block row *is* the merged document — there is no separate document-merge step that can lose or duplicate content. |
+| Response validation | `translate/batchValidation.ts:129-177` | Count → shape → **order-independent FNV-1a checksum** → exact id set → non-empty. Output is rebuilt in *input* order; model output order is never trusted. |
+| Retry ladder | `translate/engine.ts:246-333` | full batch → halve → per-line → single-line repair → **split the line at its own sentence/row boundaries** → keep source at `confidence 0.2` / `kept-original`. Never loses a line. |
+| Key pool | `translate/keyPool.ts` | rpm/tpm/rpd sliding buckets, `Retry-After` honoured, exponential backoff ±25% jitter, quota → 1 h, invalid keys removed, live headers override estimates, state persisted + rehydrated on restart. |
+| Multi-key rotation | `translate/executor.ts:151-273` | Rotates on 429/5xx/timeout, advances the model chain on 404, waits when all keys cool, gives up after 30 consecutive failures. |
+| Concurrency | `translate/concurrency.ts` | AIMD 1↔3 with per-page mutex — already adapts to error rate. |
+
+The problem is **not** "we cannot process a large document". The problem is that **the size of each request is guessed, not computed**, and the guess is wrong in a way that compounds.
+
+> **Status:** root causes **A** (§1.1) and **B** (§1.2) are fixed as of Phase A (§5.1). Root cause **C** (§1.3) is now fixed as of Phase B (§5.2) — the budget is model-derived and hard, and the packer works in structural units. Only the thin neighbour window remains (Phase C).
+
+### 1.1 Root cause A — the token estimate is script-blind
+
+`estimateTokens` (`keyPool.ts:129-131`) is `max(1, ceil(text.length / 3))`. That ratio is tuned for English. Every downstream calculation inherits it:
+
+- `batching.ts:45,77` — batch size budget (`maxTokens: 1500`);
+- `engine.ts:153,276` — the **TPM bucket** the key pool consumes;
+- `prompts.ts:185-188` — `maxOutputTokensFor = min(4000, tokens × 1.6)`.
+
+For Myanmar script (and CJK/Devanagari) BPE vocabularies are sparse, so a character carries far more than ⅓ token. If the real factor is 3–6× the estimate, a "1500-token" batch is in truth 4500–9000 tokens. Consequences:
+
+1. **The TPM bucket under-counts**, so the pool happily admits 3 concurrent batches that are really 18–27K tokens in flight → against Groq free's **8K TPM** this is a permanent 429 loop.
+2. **`maxOutputTokensFor` under-provisions**, so long Burmese lines get truncated mid-JSON → validation fails on `not-json`/`count` → the ladder splits → *more* requests → quota burns faster. A death spiral that looks like "the model cannot handle my document".
+3. The **context window is never consulted at all**. `ModelSpec.contextWindow` (`models.config.ts:29`) is display metadata; no code path feeds it into `buildBatches`, `runBatch` or the prompt builder.
+
+> This is the single highest-value fix. A document that "does not fit" is very often a document whose *estimate* was wrong, not whose model was too small.
+
+### 1.2 Root cause B — daily-quota 429s are misclassified as bursts
+
+`providers/http.ts:64-67`:
+
+```ts
+function looksLikeQuota(text: string, status: number): boolean {
+  if (status === 429) return false          // ← quota can never be detected
+  return /quota|resource_exhausted|daily limit|insufficient_quota|…/i.test(text)
+}
+```
+
+Providers return **429** for both burst throttling and daily-quota exhaustion. Because the guard short-circuits on `429`, `statusToKind` (73) always yields `rate_limit`, never `quota`. So:
+
+- `executor.ts:197-204` calls `reportRateLimit({quota:false})` → cooldown **2 s → 5 min**, not the `quotaFallbackMs` 1 h;
+- the worker maps `rate_limit` → `ALL_KEYS_COOLING_DOWN` instead of `QUOTA_EXHAUSTED` (`protocol.ts:153-162`);
+- a document that needs 1 400 requests on a 1 000-req/day tier **does not stop cleanly** — it retries against a wall 30 times and fails with a misleading reason.
+
+The body text is already parsed; the guard simply must not exclude 429.
+
+### 1.3 Root cause C — request sizing is model-blind and structurally naive
+
+`batching.ts` accumulates lines into 15–25-line batches with a flat `maxTokens: 1500`.
+Phase A replaced the flat constant with the model's real budget and made it a
+*hard* budget; the rest of this list is still open:
+
+- `minLines: 15` was a **floor consulted before the token budget**, so a page of long lines could push a batch far past budget — **fixed in Phase A** (§5.1);
+- a single oversized line had no path at all: if the model answered it badly the line silently kept its source text — **fixed in Phase B** (§5.2), which cuts it at sentence/row boundaries in the ladder's last resort;
+- `BlockKind` (`heading | paragraph | list | table | caption | footnote | shape`, `db/types.ts`) was **never consulted** — a table was split at an arbitrary line boundary and a heading could be stranded at the end of a batch — **fixed in Phase B** (§5.2);
+- ~~only **one** neighbour line is passed as context~~ — **fixed in Phase C** (§5.3): every batch also carries the nearest enclosing heading and, when known, its translation.
+
+### 1.4 The second direction of the size problem
+
+The 1500-token target is simultaneously **too large** (§1.1) and **far too small** for big-context models. On a model with a 128K window, filling only 1.5K tokens of content per request wastes >98% of the window and multiplies request count — and **requests**, not tokens, are what the free tier rationing kills (Groq: 1 000 req/day). A 1 000-page document at 25 lines/batch can exceed the daily request budget purely because batches were timid.
+
+**Conclusion:** the fix is to *compute* the batch from the model's real budget, so one request carries as much content as is safe. That reduces request count, which is the scarce resource — without switching provider.
+
+---
+
+## 2. Architecture
+
+Seven layers. Each is independently testable; none requires a provider switch.
+
+```
+ ┌──────────────────────────────────────────────────────────────┐
+ │ 1  BudgetProfile      model + quality + glossary → real limits│
+ │ 2  TokenEstimator     script-aware + self-calibrating         │
+ │ 3  StructureChunker   headings/tables/lists + oversized split │
+ │ 4  Pacing & Quota     request forecast, quota scope, ETA      │
+ │ 5  KeyScheduler       multi-key = optional throughput         │
+ │ 6  ContextContinuity  heading chain + TM + terminology sets   │
+ │ 7  Integrity          exactly-once verification at the end    │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+### Layer 1 — `BudgetProfile` (new file `src/translate/budget.ts`)
+
+The single source of truth for "how much may go into one request". Computed **once per run** from `(provider, model, quality, glossarySize)` and stored in the run config so restarts reuse identical boundaries.
+
+```ts
+export interface BudgetProfile {
+  contextWindow: number        // hard window (input + output)
+  maxOutputTokens: number      // model's real completion cap
+  promptOverheadTokens: number // system prompt + glossary + framing, measured
+  contentBudgetTokens: number  // contextWindow − overhead − maxOutput
+  fillTargetTokens: number     // ceil(contentBudget × FILL_RATIO)
+  maxLines: number             // secondary guard
+  unknown: boolean             // true when the model is unlisted/imported
+}
+
+export const FILL_RATIO = 0.85          // headroom for tokenizer drift + framing
+export const UNKNOWN_CONTEXT_WINDOW = 8_192   // conservative default
+export const UNKNOWN_MAX_OUTPUT     = 2_048
+```
+
+Sources and rules:
+
+- `contextWindow` ← `modelSpec(provider, model)?.contextWindow`, else the conservative default. Note `modelSpec` is bundled-only by design (`models.config.ts:525-529`), so imported models correctly fall back to the conservative window.
+- `maxOutputTokens` ← new optional `ModelSpec.maxOutput`; default `min(contextWindow / 2, 4_096)` when absent. Today nothing stores this, and it is the value that actually truncates Burmese output.
+- `promptOverheadTokens` ← **measure the real prompt**, not guess: `estimateTokens(systemPrompt(...)) + estimateTokens(glossaryBlock(...)) + framing`. `glossaryBlock` is capped at 200 entries (`prompts.ts:83`), which can be ~200 lines — material, and today unmeasured anywhere.
+- `contentBudgetTokens = max(1024, contextWindow − promptOverheadTokens − maxOutputTokens)`.
+- High quality doubles content volume (`reviewPrompt`, `prompts.ts:159-178` re-sends source **and** draft) → the review pass must be budgeted as a **second request** against the same window, not ignored.
+
+Wiring: `buildTranslatePlan` computes the profile and passes it to `buildBatches`; `engine.ts` uses `profile.maxOutputTokens` instead of `maxOutputTokensFor`'s flat formula; `preflight.ts:129-137` stops using its own `chars / 3.5` estimate and uses the same profile so the forecast matches reality.
+
+### Layer 2 — script-aware, self-calibrating token estimation
+
+Replace the flat `len / 3` with a **weighted estimator** (`src/translate/tokenEstimate.ts`), keeping the exact export name so the ~10 call sites stay valid:
+
+```ts
+// Per-script character→token weights, measured against real responses.
+const SCRIPT_WEIGHT = { latin: 0.30, myanmar: 1.10, cjk: 0.70, devanagari: 0.90, cyrillic: 0.35, digits: 0.40 }
+export function estimateTokens(text: string): number   // weighted sum, max(1, …)
+```
+
+Plus a **runtime calibration loop**, which is what makes this correct rather than merely less wrong:
+
+- every response already returns `usage.prompt_tokens` / `completion_tokens` (`keyPool.reportSuccess`, `translateQueue.ts:701`);
+- the run keeps `calibration = { predictedIn, actualIn, predictedOut, actualOut }`;
+- after each successful batch, `scale = clamp(actualIn / predictedIn, 0.5, 4.0)` is folded in (EWMA, α ≈ 0.3) and stored on the run;
+- `estimateTokens` for the remainder of the run is multiplied by that scale.
+
+This is self-correcting within a handful of requests regardless of language, so it also covers unknown/imported models and future tokenizer changes. Two safety properties:
+
+- **never scale down below the static weight** (a bad early sample can't inflate batches);
+- if the observed ratio stays pinned at the clamp for 3 consecutive batches, the run flags `LOW_TOKEN_CONFIDENCE` and shrinks `fillTargetTokens` by 25% rather than continuing to overshoot.
+
+### Layer 3 — structure-aware chunker ✅ shipped (§5.2)
+
+`buildBatches(projectId, epoch, pageIndex, lines, options)` kept its signature and its **order-preservation invariant** (pinned by `batching.test.ts`), but now groups *before* it packs:
+
+1. **`BatchLine.kind`** — every line carries its `BlockKind`, filled in by `toLine()` (`translateQueue.ts`) and by `inline.ts`. The packer can see the structure it is cutting.
+2. **`buildUnits(lines)`** reconstructs logical units from consecutive lines:
+   - a run of `table` lines → one unit; a run of `list` lines → one unit (cut only *between* rows/items, never inside one);
+   - `heading` → **binds forward**: the next line joins it, so a heading is never the last item in its batch;
+   - `caption` → binds **backward** to the figure/table it labels;
+   - everything else → its own unit.
+3. **`subdivide(unit)`** cuts a unit that alone exceeds `maxLines`/`maxTokens` at *line* boundaries. A line that alone exceeds the budget is still sent whole — there is nothing to cut it against, and the ladder owns it (point 4).
+4. **Pack units**, not lines: a batch may only end on a unit boundary, and `maxTokens` remains a hard budget. Order is never changed and no line is ever duplicated or dropped.
+5. **Oversized / badly-answered single line** → in the ladder's last resort, `splitLineForRetry` cuts it at the boundaries its own structure implies (table/list at `\n`, prose at sentence ends) into fragments with derived ids `` `${parentId}#s${n}` ``, sends them as **one** request, and `reassemble()` joins the results back under the parent id. Validation, review, post-processing and `persistLines` never see a fragment.
+6. **Context enrichment** ✅: each batch carries `{ before, after }` **plus** the nearest enclosing heading above it and, when already known, its translation — `PromptContext.section` / `.sectionTranslation`, tracked per line across pages while the plan is built (§5.3).
+
+The `splitBatch`/`splitToLines` rungs, the `#l<n>` id convention and `batchValidation` are untouched — `resume.test.ts` still holds.
+
+### Layer 4 — pacing and honest quota forecasting
+
+Requests, not tokens, are the scarce resource on free tiers. Before the run starts, `preflight` computes and **shows**:
+
+```
+requests   = ceil(totalContentTokens / fillTargetTokens)
+tokens     = totalContentTokens × (1 + outputRatio)
+wallTime   = requests / effectiveRpm   (with TPM as the binding constraint)
+fitsToday  = requests ≤ rpd && tokens ≤ tpd
+```
+
+- If it does not fit today, the app says so **in numbers** and states the honest outcome: the queue is durable, so the run pauses on quota and **resumes across days** — that already works (`restoreTranslate` + `QUOTA_EXHAUSTED`). This is a correct answer, not a workaround.
+- **Shipped in Phase A** (§5.1): `looksLikeQuota` consults the body text for 429 too, so `QUOTA_EXHAUSTED` is actually reported. `providers/http.test.ts` pins the Gemini (`RESOURCE_EXHAUSTED`), OpenAI (`insufficient_quota`) and Groq bodies.
+- Add a **daily request ledger** per `(provider, model)` in settings so the forecast is compared against *observed* consumption, not just the bundled `rpd`.
+
+### Layer 5 — key scheduling: multi-key is optional, never required ✅ shipped (D1)
+
+Existing behaviour already satisfies the requirement for per-key quotas: a single key works, `pick()` filters by capacity, rotation happens on 429. What was missing was **quota scope** — and without it the pool was quietly violating the "do not assume more keys = more quota" rule.
+
+`ModelSpec.quotaScope?: 'per-key' | 'per-provider'` (default `'per-key'`):
+
+- `per-key` — each key owns its own `rpm`/`tpm`/`rpd`/`tpd` buckets. True for Google AI Studio keys (per project) and OpenRouter keys (per account).
+- `per-provider` — **every key of the provider is handed the same bucket objects**, so the allowance is counted once however many keys the user configured. Groq's free tier is organisation-scoped, so this is the case that matters: two keys from one org share one 1K rpd / 8K tpm / 200K tpd budget.
+
+Sharing the *whole* allowance is the deliberate, conservative reading. Groq publishes rpm at the org level too, so a second key buys **failover, not throughput** — and where a provider did allow extra parallelism, counting it once only makes the scheduler more patient, never more optimistic. `configureLimits` re-points every key at one bucket set when the scope flips on, and seeding a shared set takes the **widest** key state (max `used`, latest `resetAt`), so switching a per-key pool into provider scope can never under-count what the org has already spent and walk into a 429.
+
+Selection preference order is unchanged: capacity-fit → `least-used`/round-robin → earliest-available. Nothing requires a second key: with one key the pool is a degenerate case of the same algorithm, and `startTranslate` continues to accept exactly one.
+
+**Daily token ledger (`tpd`).** `KeyBuckets` gains a fourth bucket. Groq publishes a 200K/day token allowance that the pool previously ignored entirely — so a large document would spend its whole day budget while the request counter still looked healthy. `tpd` is now checked in `hasCapacity`, rolled in `consume`, exposed as `tpdRemaining` (`null` = the provider publishes no such limit), and persisted with the rest. `limit === 0` means *unknown*, never zero: an unknown daily allowance blocks nothing. Records written before the ledger shipped restore cleanly (the field is simply absent → unknown), so this is a transparent migration.
+
+
+### Layer 6 — context continuity across chunks ✅ shipped (§5.3)
+
+Long documents lose coherence when each request sees only ~25 lines. Mitigations, in the order they were built:
+
+1. **Heading chain** ✅ — the nearest heading *above* a batch plus, when it is already known, its translation. Every batch carries `PromptContext.section` / `.sectionTranslation`, rendered first in the user prompt so the model anchors on it before the neighbour lines. Sections are tracked per line while the plan is built and carried **across pages** (`buildTranslatePlan`), so a document whose first heading is on page 3 still means something on page 4. A heading line itself is given the section *above* it — it opens a new section rather than sitting in its own.
+2. **TM reuse** ✅ — `lookupTranslation` reads and `storeTranslation` writes, so a line that repeats verbatim costs nothing and stays identical across chunks and restarts.
+3. **Terminology sets** ✅ — `seenPage`/`seenDocument` flow into every request, and are now **re-seeded from Dexie on every plan build** (`annotatedTerms`, `terminology.ts`). Previously a restore started both sets empty, so a document-scope run restarted halfway would annotate the same term twice and a page-scope run would repeat a page's first annotation. Skipped-but-translated blocks count (their annotation is in the document); `todo` blocks do not (they are about to be rewritten).
+4. **Rolling glossary** ✅ — `src/translate/rollingGlossary.ts`. A `source → target` pair the run produced via a source-derived annotation is counted; after **3 consistent choices** it is promoted into `run.glossary`, which is already sent **per request** (`glossary: run.glossary`), so the change reaches the very next batch. Guarded four ways because a learned entry is *enforced*: never a term the user's own glossary owns; never past `GLOSSARY_CAP` entries or the token ceiling below; never a term the model disagreed with about (disagreement **drops the evidence** rather than picking a winner); never learned from a result with `confidence < 0.7`.
+
+**Why the ceiling is in tokens, not entries.** The glossary lives in the *system prompt*, and `promptOverheadTokens` is measured from the real `systemPrompt(...)` — so growth during a run would break the window invariant. The fill ratio uses only `FILL_RATIO` (85%) of the content budget, leaving 15% unused; learning is bounded to **10% of that same slack** (`ROLLING_GLOSSARY_SHARE`, capped in absolute terms at 512 tokens). `promptOverheadTokens + fillTargetTokens + maxOutputTokens ≤ contextWindow` therefore stays true however much a 350-page run picks up, and — because the budget is only *reserved* by the fill ratio, never re-measured — a run that learns nothing pays nothing for the feature.
+
+### Layer 7 — merge integrity verification ✅ shipped (D2)
+
+The merge is already exactly-once per block (per-block writes + id-set validation + re-plan-from-state). What was missing was a way to *see* that it held. `translate/integrity.ts` adds:
+
+```ts
+verifyDocumentIntegrity(projectId, config): IntegrityReport
+// { ok, checked, missing: string[], duplicated: string[] }
+```
+
+The design decision is that "missing" and "duplicated" are **not** derived from a second, parallel notion of the document. The verifier simply **re-plans the project with the same `buildTranslatePlan` the run used**, then reads two things off the result:
+
+- every line still in a job is a block that never landed → `missing`;
+- any line id appearing in more than one job → `duplicated`.
+
+Re-run after the queue settles, the pending jobs are *exactly* the in-scope blocks that never received a translation, and the line ids are *exactly* what the run would send — so the report can never disagree with the queue about what counts as work, skip rules, locks, user edits and the image switch included. It is attached to `CoverageReport.integrity`, so the existing post-run panel gets it for free.
+
+Any `missing` id is automatically re-queued on the next run because it is still `pending` in Dexie — the invariant is self-healing; this makes the gap *visible*, and answers the only question the queue itself could not: "is this document actually whole?"
+
+---
+
+## 3. What chunking genuinely cannot fix
+
+Stated plainly, per the brief:
+
+1. **A single sentence larger than the model's context window.** No chunker splits it. The fallback is a flagged keep-original (`kept-original`, confidence 0.2) — already the engine's terminal behaviour — surfaced in coverage. Rare, and honest.
+2. **A document whose total token count exceeds the provider's *daily token* allowance.** Chunking cannot make 5 M tokens fit a 200 K/day tier in one day. The correct behaviour is: forecast it up front (Layer 4), pause on `QUOTA_EXHAUSTED`, and resume across days on the durable queue. If the user wants it done in one sitting, that is a paid-tier decision — a *user* choice, not the mechanism.
+3. **Cross-document anaphora** (a pronoun whose antecedent is 200 pages back). Bounded context means bounded recall. The heading chain and document glossary recover most of it; the residual is a quality limit inherent to chunked translation, not a scheduling defect.
+
+---
+
+## 4. Design invariants (to be pinned by tests)
+
+1. **Order**: flattened batch line ids, in order, equal the input block ids, in order. *(already pinned)*
+2. **Exactly-once**: after any sequence of start → fail → restore → resume, every block id is produced exactly once and every block ends `translated`/`edited`/`skipped`. *(already pinned)*
+3. **Budget safety**: for every emitted batch, `estimateTokens(system) + estimateTokens(user) + maxOutputTokens ≤ contextWindow`. *(new)*
+4. **Structure atomicity**: no table is split between rows; no heading terminates a batch; lists split only between items. *(new)*
+5. **Calibration monotonicity**: the calibration scale is clamped to `[0.6, 4]`, and may not fall below 1 until five samples agree — one noisy response can shrink batches only upward. *(pinned by `tokenEstimate.test.ts`)*
+6. **Single-key sufficiency**: every scenario in the test suite must pass with exactly one API key. *(new assertion on existing tests)*
+7. **Non-additive quota**: with `quotaScope: 'per-provider'`, N keys never admit more tokens/day than one key. *(new)*
+
+---
+
+## 5. Implementation phases
+
+Each phase is independently shippable, gated by `tsc · eslint · prettier · vitest · build · smoke`.
+
+| Phase | Deliverable | Primary files | Why first |
+|---|---|---|---|
+| **A ✅ shipped** | `BudgetProfile` + script-aware estimator + calibration + the 429-quota classification fix | `translate/budget.ts`, `translate/tokenEstimate.ts`, `translate/batching.ts`, `providers/http.ts`, `translate/engine.ts`, `translate/translateQueue.ts`, `workers/translation.worker.ts` | Fixes the root cause. Largest accuracy gain, smallest blast radius. |
+| **B ✅ shipped** | Structure-aware chunker (logical units, heading/caption binding, oversized-line rescue) | `translate/batching.ts`, `translate/types.ts`, `translate/engine.ts` | Turns correct budgets into *well-formed* requests. |
+| **C ✅ shipped** | Context continuity (heading chain, terminology reseed on restore, rolling glossary) | `translate/prompts.ts`, `translate/translateQueue.ts`, `translate/types.ts`, `translate/terminology.ts`, `translate/rollingGlossary.ts` | Quality at scale, cheap. |
+| **D ✅ shipped** | Quota scope + daily token ledger, forecast alignment, integrity verification | `config/models.config.ts`, `translate/keyPool.ts`, `translate/protocol.ts`, `db/types.ts`, `pdf/pdfExtract.ts`, `pdf/preflight.ts`, `translate/integrity.ts`, `translate/coverage.ts` | Makes multi-key honest and large runs observable. |
+
+### 5.1 Phase A — what shipped
+
+**New: `translate/tokenEstimate.ts`.** Script-aware `estimateTokens`. ASCII keeps
+the exact `ceil(count / 3)` arithmetic, so Latin documents produce byte-identical
+batches to before; Myanmar is charged 1.10 a character, Thai 0.95, Devanagari
+0.90, Arabic 0.75, CJK/Hangul 0.70, combining marks 0.50. Alongside it,
+`recordTokenCalibration(predicted, actual)` is an EWMA on a scale factor driven by
+the `usage.prompt_tokens` every provider already returns — clamped to `[0.6, 4]`,
+and forbidden from shrinking below 1 until five samples agree, because shrinking
+is the direction that makes batches *bigger*.
+
+**New: `translate/budget.ts`.** `computeBudget({ provider, models, quality, … })`
+→ `BudgetProfile`. The **narrowest window in the fallback chain** wins, so a batch
+sized for the selected model also fits whatever fallback answers.
+`promptOverheadTokens` is *measured* from the real `systemPrompt(...)`, which
+already embeds up to 200 glossary lines; High quality divides the content budget
+by 2.05 because its review pass re-sends source **and** draft.
+
+**Wired through:**
+
+- `buildTranslatePlan` passes `maxTokens = profile.fillTargetTokens` to
+  `buildBatches`, and the `minLines` gate that let a page of long lines overshoot
+  the budget is gone — `maxTokens` is now a hard budget. `BATCH_DEFAULTS` loses
+  `minLines`. Batching for Latin documents is unchanged.
+- `engine.ts` takes an optional `budget` and uses `maxOutputFor(profile, batch)` —
+  a completion cap proportional to what is actually being sent, clamped by the
+  model — instead of the flat `min(4000, tokens × 1.6)` that was truncating long
+  Burmese lines mid-JSON. With `calibrate: true` it folds each response's usage
+  back into the estimator; `translation.worker.ts` turns that on and resets the
+  scale per session.
+- `providers/http.ts` — `looksLikeQuota` no longer returns `false` for 429.
+  Daily / `per day` / `insufficient_quota` bodies are now `quota` (1 h cooldown →
+  `QUOTA_EXHAUSTED`); `per minute` / `try again in …` bodies stay `rate_limit`.
+  This is what lets a document that needs more requests than the day's allowance
+  stop cleanly and resume, instead of retrying against a wall thirty times.
+
+**Deferred from the original Phase A list: `pdf/preflight.ts`.** Its
+`estimateTranslationWork` is handed a bare character count, so a script-aware
+estimate needs text it does not have — resolved in **Phase D** (§5.4), which
+measures the tokens in the analysis probe where the text still exists.
+
+**Explicitly out of scope as a "solution":** auto-switching OpenRouter→Groq, and
+Local AI. Both stay available as user-selectable options; neither is load-bearing
+for large files.
+
+### 5.2 Phase B — what shipped
+
+Phase A made the request *sized correctly*. Phase B makes it *well formed*.
+
+**`BatchLine.kind`.** The line the packer manipulates now carries the
+`BlockKind` it came from. It is filled in at both construction sites
+(`toLine()` in `translateQueue.ts`, the inline path in `inline.ts`), and
+`translateQueue`'s `QueueSnapshot` deliberately does **not** persist lines —
+batches are re-planned from Dexie on restore — so there is no legacy shape to
+migrate.
+
+**Units, then packing.** `buildUnits(lines)` groups before `buildBatches`
+packs:
+
+| Rule | Effect |
+|---|---|
+| consecutive `table` → one unit, consecutive `list` → one unit | a run is cut only *between* rows/items |
+| `heading` binds **forward** (the next line joins it) | a heading is never the last line of its batch, so the body is never translated without its title |
+| `caption` binds **backward** (joins the figure/table above) | a caption never opens a batch |
+| everything else → its own unit | Latin prose batches are unchanged |
+
+A batch may only end on a unit boundary. A unit that alone exceeds
+`maxLines`/`maxTokens` is cut at *line* boundaries by `subdivide` — never inside
+one — so `maxTokens` is still a hard budget. A single line that alone exceeds
+the budget is still sent whole (there is nothing to cut it against yet).
+
+**The ladder's new last resort.** `splitLineForRetry` (batching.ts) cuts one
+line at the boundaries its structure implies: table/list at `\n`, prose at
+sentence ends (a terminator followed by whitespace, so `3.14` and `A.B` are left
+alone). Fragments get derived ids `parent#s0`, `parent#s1`, …, carry only the
+placeholders that actually occur in them, and are sent as **one** request after
+the normal attempt and the repair attempt have both failed. `reassemble()`
+joins the results back under the parent id — weakest confidence, strongest flag
+— so validation, the review pass, post-processing and `persistLines` all keep
+seeing exactly one line with its original id.
+
+The rescue is deliberately **bounded to one request**. Letting fragments fall
+through to the line-by-line rung would cost two requests *per row* of a large
+table on a line that is about to be kept anyway — a free tier's whole day burnt
+on a failure. So: attempt → repair → fragments → terminal, i.e. three requests
+worst case for a hopeless line (two before, for a line with nothing to cut).
+
+**What Phase B did not change:** `splitBatch`, `splitToLines`, the `#l<n>` id
+convention, `batchValidation`, `persistLines`, and the exactly-once resume
+invariants in `resume.test.ts`. Order preservation is still pinned by
+`batching.test.ts` — units regroup lines, they never reorder them.
+
+**Known limitation:** the sentence splitter is deliberately naive (it does not
+know about abbreviations such as `Mr.`), because a fragment boundary is never a
+content boundary — the pieces are rejoined before anything downstream sees them.
+
+### 5.3 Phase C — what shipped
+
+Phases A and B made each request well formed. Phase C makes the **40th** request
+remember what the **1st** established.
+
+**`PromptContext.section` / `.sectionTranslation`** (`types.ts`). `buildTranslatePlan`
+already walks every page's blocks in reading order, so it tracks the nearest
+heading while it goes and records the section *above* each line into a
+`Map<lineId, SectionRef>`. Each batch then inherits the section of **its first
+line** — the heading that encloses it — and that map is seeded from the previous
+page's last heading, so sections carry across page boundaries. A heading line
+itself is given the section above it: it opens a new section, it does not sit in
+its own.
+
+`userPrompt` renders the section **before** the neighbour lines
+(`Section heading (context only): …`, then `Already translated as (context only): …`
+when the heading already has a translation — which is exactly the resume case).
+This is the cheapest mitigation in Layer 6 at roughly ten tokens a batch, and it
+is what stops a heading stranded at the end of a batch from leaving its body
+untranslated without a section title.
+
+**`terminology.annotatedTerms(text, sourceText)`.** A read-only twin of
+`normalizeTerminology`: same `innerIsFromSource` predicate, no mutation. The
+predicate was extracted so the two can never disagree about what counts as *our*
+annotation versus an ordinary parenthetical. `buildTranslatePlan` now calls it
+over every already-translated block and hands the result to `startTranslate` as
+`plan.terminologySeed`, which fills `run.seenPage`/`run.seenDocument` instead of
+the empty `Map`/`Set` a restore used to start with. Without this a document-scope
+run restarted halfway would annotate a term a second time, and a page-scope run
+would repeat a page's first annotation. Skipped-but-translated blocks are
+included (their annotation is in the document); `todo` blocks are not (they are
+about to be rewritten).
+
+**`translate/rollingGlossary.ts`** (new). `persistLines` is already the single
+place a translated line is accepted, and `run.glossary` is already sent
+*per request* — so learning needs no plumbing. After each batch,
+`promoteLearnedTerms` walks the annotations the run itself produced
+(`terminology.extractTermPairs`), and a `source → target` pair chosen **3 times
+consistently** is appended to `run.glossary` and reaches the very next request.
+
+A learned entry is *enforced* — `enforceGlossary` can rewrite later lines and
+raise `glossary-miss` — so it is guarded four ways:
+
+| Guard | Why |
+|---|---|
+| never a term the user's glossary owns (`userKeys`) | the user's wording always wins |
+| never past `GLOSSARY_CAP` entries or the token ceiling | see below |
+| never a term the model disagreed with about | disagreement **drops the evidence** instead of picking a winner; an enforced guess is worse than no enforcement |
+| never learned from `confidence < 0.7` | do not enforce what was not trusted |
+
+**The ceiling is in tokens, not entries.** The glossary lives in the *system
+prompt*, whose length is measured once into `promptOverheadTokens` — so mid-run
+growth would silently break the window invariant. The fill ratio uses 85% of the
+content budget, leaving 15% slack; learning is bounded to **10% of that same
+slack** (`ROLLING_GLOSSARY_SHARE`, absolute cap 512 tokens). The invariant
+`promptOverhead + fillTarget + maxOutput ≤ contextWindow` therefore survives
+however much a 350-page run learns, and because the slack already existed, a run
+that learns nothing pays **nothing** for the feature — no requests are made
+longer.
+
+**What Phase C did not change:** `tm.ts` (TM reuse was already correct),
+`enforceGlossary`, `budget.ts`, `batching.ts`, the queue's persistence model, or
+any of the resume invariants. Learned glossary entries are **in-memory for the
+run's lifetime** — persisting them would write into the user's own glossary
+table, and they are re-learned within a handful of batches after a restart.
+
+### 5.4 Phase D — what shipped
+
+Phases A–C made the requests well formed and mutually coherent. Phase D makes
+the **accounting** honest — the scheduler now knows what the provider will
+actually allow, and the user can verify what the run actually produced.
+
+**Quota scope** (`ModelSpec.quotaScope`, `translate/keyPool.ts`). The pool used
+to give every key its own `rpm`/`tpm`/`rpd` buckets, which is true for Google
+AI Studio keys (per project) and OpenRouter keys (per account) — and false for
+Groq, whose free tier is organisation-scoped. Two Groq keys were therefore
+scheduled against 2K requests and 16K tpm of a budget that is really 1K and 8K.
+Under `'per-provider'` every key is handed the **same bucket objects**, so the
+allowance is counted once. `configureLimits` re-points the keys when the scope
+flips on, and seeding a shared set takes the *widest* key state, so switching a
+per-key pool into provider scope can never under-count what the org has already
+spent. The second key buys failover, not quota — and the provider card now says
+so rather than letting the user find out at request 1,001.
+
+**Daily token ledger** (`KeyBuckets.tpd`). Groq publishes a 200K/day token
+allowance the pool ignored entirely: a large document could spend its whole day
+budget while the request counter still looked healthy. `tpd` is now checked in
+`hasCapacity`, rolled in `consume`, exposed as `tpdRemaining` and persisted.
+`limit === 0` means *unknown*, never zero — an unknown daily allowance blocks
+nothing. Records written before the ledger shipped restore cleanly.
+
+**Forecast alignment** (`pdf/pdfExtract.ts`, `pdf/preflight.ts`). This is the
+item Phase A deferred: `estimateTranslationWork` was handed a bare character
+count, and `chars / 3.5` under-forecasts a Myanmar document by roughly **3×**,
+because a Burmese character is worth several times an English one. With the
+daily ledger now actually enforcing the token budget, a 3×-optimistic forecast
+becomes a run that stops half-way. The fix measures the tokens in the *analysis
+probe*, where the text still exists (`ProbeSummary.totalTokens`, via the same
+`estimateTokens` the run will use), and the wizard passes it through. The
+request and time estimates are deliberately unchanged — they are block-count
+heuristics, and the token fix is about the quota comparison the ledger enforces.
+
+**Integrity verification** (`translate/integrity.ts`, Layer 7). Rather than
+maintain a second notion of the document, the verifier **re-plans with the same
+`buildTranslatePlan`** and reads two facts off the result: lines still in a job
+are blocks that never landed (`missing`), and an id appearing in more than one
+job is a duplicate (`duplicated`). Attached to `CoverageReport.integrity`, so the
+existing post-run panel gets it without new wiring.
+
+**What Phase D did not change:** selection preference order (capacity-fit →
+`least-used`/round-robin → earliest-available), single-key sufficiency, or
+`startTranslate`'s acceptance of exactly one key. Nothing in the design requires
+a second key — with one key the pool is a degenerate case of the same algorithm.
+
+**Known limitation:** `per-provider` shares *every* bucket, including rpm. Groq
+does publish rpm at the org level so this matches reality there, but a provider
+that allowed extra per-key parallelism would be scheduled more patiently than
+strictly necessary. That is the conservative direction — it costs throughput,
+never correctness.
+

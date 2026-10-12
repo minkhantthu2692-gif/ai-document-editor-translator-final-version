@@ -1,0 +1,418 @@
+/**
+ * Rotation executor — "send this exact call, on whichever key can take it".
+ *
+ * Guarantees the Phase 3 acceptance criteria rest on:
+ *  - a 429 on key A rotates to key B **and re-runs the same call**, so a batch
+ *    is either fully delivered or still pending — never half-applied;
+ *  - 401/403 marks the key invalid instead of retrying it forever;
+ *  - when every key is cooling the loop parks on `availableAt()` (the
+ *    WAITING_RATE_LIMIT countdown) and resumes by itself — but never forever:
+ *    N whole wait windows with zero successes surface a retryable failure;
+ *  - a missing model walks the fallback chain, then gives up with
+ *    MODEL_UNAVAILABLE instead of burning quota.
+ *
+ * Pure async code with injected transport/sleep — the 429-storm tests drive it
+ * on a virtual clock.
+ */
+
+import { ProviderError, RETRYABLE_KINDS, type ProviderErrorKind } from '@/providers/types'
+import type { RateLimitInfo } from '@/providers/rateLimit'
+import type { KeyPool, KeyLease, WaitWindow } from './keyPool'
+import type { TranslateCall } from '@/providers/types'
+import type { AttemptDiag } from './types'
+
+export interface TransportOk {
+  text: string
+  tokensIn: number
+  tokensOut: number
+  latencyMs: number
+  rate: RateLimitInfo
+}
+
+export interface TransportInput {
+  call: TranslateCall
+  lease: KeyLease
+  model: string
+  signal?: AbortSignal
+}
+
+export type BatchTransport = (input: TransportInput) => Promise<TransportOk>
+
+export type WaitingReason = 'ALL_KEYS_COOLING_DOWN' | 'QUOTA_EXHAUSTED'
+
+export interface ExecutorHooks {
+  /** Called every time the executor parks until `until` (auto-resume). */
+  onWaiting?: (until: number, reason: WaitingReason, window: WaitWindow) => void
+  /** Called after each failed attempt (before the next key/model is chosen). */
+  onRetry?: (info: {
+    keyId: string
+    kind: ProviderErrorKind
+    detail: string
+    model: string
+  }) => void
+  /** Called when the model chain advances (404 from the provider). */
+  onModelFallback?: (model: string) => void
+  /** Called when a lease is taken, so the UI can show the masked key. */
+  onLease?: (lease: KeyLease, model: string) => void
+  /**
+   * Called once per provider round trip — success or failure — with the
+   * structured diagnostics record (masked key, category, duration, reported vs
+   * estimated usage). Never carries the secret.
+   */
+  onAttempt?: (info: AttemptDiag) => void
+}
+
+export interface ExecutorOptions {
+  pool: KeyPool
+  /** Ordered model chain: selected model first, then fallbacks. */
+  models: string[]
+  transport: BatchTransport
+  tokenEstimate?: number
+  signal?: AbortSignal
+  now?: () => number
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>
+  /** Consecutive failures tolerated before the run fails hard. */
+  maxConsecutiveFailures?: number
+  /**
+   * Consecutive rate-limit *parks* (each one a full wait window, zero
+   * successful requests in between) tolerated before the run surfaces a
+   * terminal, retryable failure instead of waiting forever (L-05). Any
+   * success resets the count, so a slow-but-progressing run is never cut off.
+   */
+  maxWaitCycles?: number
+  hooks?: ExecutorHooks
+}
+
+export interface ExecutorResult {
+  text: string
+  tokensIn: number
+  tokensOut: number
+  latencyMs: number
+  rate: RateLimitInfo
+  keyId: string
+  maskedKey: string
+  model: string
+  /** Attempts spent (1 = first key, first model). */
+  attempts: number
+  /** Round trips that needed a retry of any kind. */
+  retries: number
+}
+
+/** Abortable sleep; the default clock used by the executor. */
+export function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('aborted', 'AbortError'))
+      return
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      reject(new DOMException('aborted', 'AbortError'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+function isAbort(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true
+  return error instanceof DOMException && error.name === 'AbortError'
+}
+
+/**
+ * The channel a "Try now" button uses to cut a rate-limit wait short.
+ *
+ * The executor parks *inside* `sleep()` between batches. Aborting the run's
+ * signal there would fail the whole run, and the wait can be minutes long, so
+ * the wait gets its own interruption: `fire()` ends every sleep in progress
+ * and the executor loop re-reads the pool — it then either finds a usable key
+ * (the backoffs are gone) or parks again on the same deadline (an untouched
+ * provider bucket still refuses, which is exactly what should happen).
+ */
+export class WakeChannel {
+  private readonly listeners = new Set<() => void>()
+
+  /** Ends every sleep registered through this channel. */
+  fire(): void {
+    for (const listener of [...this.listeners]) listener()
+  }
+
+  /** Sleep that `fire()` can end early; abort behaviour matches `defaultSleep`. */
+  sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new DOMException('aborted', 'AbortError'))
+        return
+      }
+      let settled = false
+      const finish = (): boolean => {
+        if (settled) return false
+        settled = true
+        clearTimeout(timer)
+        this.listeners.delete(onWake)
+        signal?.removeEventListener('abort', onAbort)
+        return true
+      }
+      const onWake = (): void => {
+        if (finish()) resolve()
+      }
+      const onAbort = (): void => {
+        if (finish()) reject(new DOMException('aborted', 'AbortError'))
+      }
+      // Declared after the closures that use it, but only ever *called* once
+      // the timer, the listener and the abort handler are all registered.
+      const timer = setTimeout(() => {
+        if (finish()) resolve()
+      }, ms)
+      this.listeners.add(onWake)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+}
+
+function asProviderError(error: unknown): ProviderError {
+  if (error instanceof ProviderError) return error
+  const message = error instanceof Error ? error.message : String(error)
+  if (/timeout|timed out/i.test(message)) {
+    return new ProviderError('timeout', message, { cause: error })
+  }
+  if (/abort/i.test(message)) return new ProviderError('network', message, { cause: error })
+  return new ProviderError('network', message, { cause: error })
+}
+
+/**
+ * Runs one logical request to completion, rotating over keys and models.
+ * Rejects only when the call can no longer make progress (dead keys, bad
+ * request, model chain exhausted, failure budget spent) or on abort.
+ */
+export async function executeWithRotation(
+  makeCall: () => TranslateCall,
+  options: ExecutorOptions,
+): Promise<ExecutorResult> {
+  const {
+    pool,
+    transport,
+    tokenEstimate = 0,
+    signal,
+    now = () => Date.now(),
+    sleep = defaultSleep,
+    maxConsecutiveFailures = 30,
+    maxWaitCycles = 12,
+    hooks = {},
+  } = options
+
+  const models = options.models.filter((model) => model.length > 0)
+  if (models.length === 0) {
+    throw new ProviderError('model_missing', 'No model configured for this run')
+  }
+
+  let modelIndex = 0
+  let attempts = 0
+  let retries = 0
+  let consecutiveFailures = 0
+  let waitCycles = 0
+  let lastError: ProviderError | null = null
+
+  /**
+   * The terminal condition for an endless park/retry loop (L-05): every wait
+   * window elapsed without a single successful request. The failure is
+   * retryable — the queue pauses with a reason code and "Fix & Resume" /
+   * a later restart picks the batch up again — but the run no longer parks
+   * forever, which is what a user staring at a frozen countdown saw.
+   */
+  const stallError = (reason: WaitingReason, until: number): ProviderError => {
+    const kind: ProviderErrorKind = reason === 'QUOTA_EXHAUSTED' ? 'quota' : 'rate_limit'
+    const deadline = new Date(until).toISOString()
+    return new ProviderError(
+      kind,
+      `Waited through ${maxWaitCycles} consecutive rate-limit windows without one successful ` +
+        `request (last wait until ${deadline}). Stopped instead of waiting forever — retry ` +
+        `later, or add/enable another key.`,
+    )
+  }
+
+  /** The one place the loop waits; every park counts against `maxWaitCycles`. */
+  const park = async (
+    until: number,
+    reason: WaitingReason,
+    window: WaitWindow,
+  ): Promise<void> => {
+    waitCycles += 1
+    if (waitCycles > maxWaitCycles) throw stallError(reason, until)
+    hooks.onWaiting?.(until, reason, window)
+    await sleep(Math.max(0, until - now()), signal)
+  }
+
+  for (;;) {
+    if (signal?.aborted) throw new DOMException('aborted', 'AbortError')
+
+    const lease = pool.pick(tokenEstimate, now())
+    if (lease) {
+      const model = models[Math.min(modelIndex, models.length - 1)]
+      attempts += 1
+      hooks.onLease?.(lease, model)
+      const attemptStarted = now()
+      try {
+        const outcome = await transport({ call: makeCall(), lease, model, signal })
+        pool.reportSuccess(lease.keyId, {
+          tokensIn: outcome.tokensIn,
+          tokensOut: outcome.tokensOut,
+          rate: outcome.rate,
+          now: now(),
+        })
+        hooks.onAttempt?.({
+          attempt: attempts,
+          model,
+          keyId: lease.keyId,
+          maskedKey: lease.masked,
+          durationMs: outcome.latencyMs,
+          ok: true,
+          category: 'ok',
+          tokensIn: outcome.tokensIn,
+          tokensOut: outcome.tokensOut,
+          estimatedTokens: tokenEstimate,
+        })
+        // Any success proves the run is progressing: the endless-park budget
+        // starts over (L-05 only counts *stalls*, never slow progress).
+        waitCycles = 0
+        return {
+          text: outcome.text,
+          tokensIn: outcome.tokensIn,
+          tokensOut: outcome.tokensOut,
+          latencyMs: outcome.latencyMs,
+          rate: outcome.rate,
+          keyId: lease.keyId,
+          maskedKey: lease.masked,
+          model,
+          attempts,
+          retries,
+        }
+      } catch (error) {
+        if (isAbort(error, signal)) throw error
+        const providerError = asProviderError(error)
+        lastError = providerError
+        consecutiveFailures += 1
+        retries += 1
+        hooks.onRetry?.({
+          keyId: lease.keyId,
+          kind: providerError.kind,
+          detail: providerError.message,
+          model,
+        })
+        hooks.onAttempt?.({
+          attempt: attempts,
+          model,
+          keyId: lease.keyId,
+          maskedKey: lease.masked,
+          durationMs: Math.max(0, now() - attemptStarted),
+          ok: false,
+          category: providerError.kind,
+          tokensIn: 0,
+          tokensOut: 0,
+          estimatedTokens: tokenEstimate,
+        })
+
+        switch (providerError.kind) {
+          case 'unauthorized':
+            // 401 = the provider did not accept the credential: a dead key.
+            pool.markInvalid(lease.keyId, providerError.message, now())
+            break
+          case 'forbidden':
+            // 403 = "authenticated but denied", and providers also use it for
+            // *model*-level gates (OpenRouter restricts some free models to
+            // agentic harnesses) where the key itself is fine. Live evidence
+            // (Oct 2026): poisoning the key on a gated model's 403 killed a
+            // whole run with healthy keys. Walk the chain first, like 404, and
+            // only condemn the key once every model was refused.
+            if (modelIndex < models.length - 1) {
+              modelIndex += 1
+              hooks.onModelFallback?.(models[modelIndex])
+              break
+            }
+            pool.markInvalid(lease.keyId, providerError.message, now())
+            break
+          case 'rate_limit':
+            pool.reportRateLimit(lease.keyId, {
+              retryAfterMs: providerError.retryAfterMs,
+              quota: false,
+              rate: providerError.rate,
+              now: now(),
+            })
+            break
+          case 'quota':
+            pool.reportRateLimit(lease.keyId, {
+              retryAfterMs: providerError.retryAfterMs,
+              quota: true,
+              rate: providerError.rate,
+              now: now(),
+            })
+            break
+          case 'server':
+          case 'network':
+          case 'timeout':
+            pool.reportTransient(lease.keyId, now())
+            break
+          case 'model_missing':
+            if (modelIndex < models.length - 1) {
+              modelIndex += 1
+              hooks.onModelFallback?.(models[modelIndex])
+              break
+            }
+            // The whole chain answered 404 — retrying the last known-missing
+            // model only burns quota, so surface MODEL_UNAVAILABLE now.
+            throw providerError
+          case 'bad_request':
+          case 'unknown':
+            // Not the key's fault — retrying on another key would waste quota.
+            throw providerError
+          default:
+            break
+        }
+
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+          throw (
+            lastError ??
+            new ProviderError('server', 'Too many consecutive failures without a success')
+          )
+        }
+        continue
+      }
+    }
+
+    // No key right now: wait for the earliest cooldown/bucket reset.
+    const wait = pool.waitingDetail(tokenEstimate, now())
+    if (wait === null) {
+      const reason = pool.exhaustionReason(now())
+      if (reason === 'NO_API_KEY') {
+        throw new ProviderError('unauthorized', 'No API key is configured for this provider')
+      }
+      if (reason === 'INVALID_KEY') {
+        throw new ProviderError('unauthorized', 'Every configured key was rejected')
+      }
+      // Unknown deadline (e.g. bucket windows already rolled over) — back off a
+      // little instead of spinning. It is our own five-second guess, so it is
+      // reported as a cooldown and never dressed up as a provider window.
+      const fallbackUntil = now() + 5_000
+      const waitingReason: WaitingReason =
+        reason === 'QUOTA_EXHAUSTED' ? 'QUOTA_EXHAUSTED' : 'ALL_KEYS_COOLING_DOWN'
+      await park(fallbackUntil, waitingReason, 'cooldown')
+      continue
+    }
+
+    const reason: WaitingReason =
+      pool.exhaustionReason(now()) === 'QUOTA_EXHAUSTED'
+        ? 'QUOTA_EXHAUSTED'
+        : 'ALL_KEYS_COOLING_DOWN'
+    consecutiveFailures = 0
+    await park(wait.until, reason, wait.window)
+  }
+}
+
+/** True when an error is worth rotating to another key/model. */
+export function isRetryable(error: unknown): boolean {
+  if (!(error instanceof ProviderError)) return true
+  return RETRYABLE_KINDS.includes(error.kind) || error.kind === 'model_missing'
+}

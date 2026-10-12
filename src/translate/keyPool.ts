@@ -1,0 +1,813 @@
+/**
+ * Key pool — rotation, token buckets and cooldown bookkeeping for BYOK keys.
+ *
+ * One instance owns every key of the run. It answers three questions the rest
+ * of the pipeline depends on:
+ *
+ *   1. `pick()`     — which key may send the next request *right now*?
+ *   2. `availableAt()` — when will a key be available again (the WAITING_RATE_LIMIT
+ *      countdown), or `null` when one is available now;
+ *   3. `persisted()` — what must be written back to IndexedDB so a refresh keeps
+ *      cooldowns, usage counters and bucket positions.
+ *
+ * Every function is pure w.r.t. its `now` argument, so the 429-storm tests run
+ * on a virtual clock with no timers.
+ *
+ * Token *sizes* are not this module's business — the buckets are fed
+ * `estimateTokens()` from `tokenEstimate.ts`, which knows that a Burmese
+ * character is worth several times an English one.
+ */
+
+import type { RateLimitInfo } from '@/providers/rateLimit'
+import type { BucketState, CooldownReason, KeyBuckets } from '@/db/types'
+import type { QuotaScope } from '@/config/models.config'
+
+export type { BucketState, CooldownReason, KeyBuckets, QuotaScope }
+
+export type KeyHealthState = 'healthy' | 'cooling-down' | 'invalid' | 'quota-exhausted' | 'disabled'
+
+/** Which allowance is holding a wait: the per-minute or per-day window, or a key's own backoff. */
+export type WaitWindow = 'minute' | 'day' | 'cooldown'
+
+/**
+ * Lower ranks win a tie, so an equal deadline is reported as the window that
+ * actually caused it rather than as our own backoff.
+ */
+const WINDOW_RANK: Record<WaitWindow, number> = { day: 0, minute: 1, cooldown: 2 }
+
+export interface WaitDetail {
+  /** Epoch ms before which no key can serve a request. */
+  until: number
+  /** The window that set `until`, so the UI can name it instead of guessing. */
+  window: WaitWindow
+}
+
+export interface PersistedKeyState {
+  id: string
+  enabled: boolean
+  status: 'unknown' | 'valid' | 'invalid' | 'cooling' | 'quota'
+  statusDetail: string
+  cooldownUntil: number
+  cooldownReason: CooldownReason | null
+  lastCheckedAt: number | null
+  requests: number
+  tokensIn: number
+  tokensOut: number
+  lastUsedAt: number
+  buckets: KeyBuckets
+}
+
+export interface KeySeed {
+  id: string
+  provider: string
+  nickname: string
+  lastFour: string
+  enabled: boolean
+  /** Plaintext secret; `null` until the run has opened the sealed record. */
+  secret: string | null
+  /** Health restored from IndexedDB (a refreshed page keeps its cooldowns). */
+  persisted?: Partial<PersistedKeyState>
+}
+
+export interface KeyLease {
+  keyId: string
+  secret: string
+  nickname: string
+  /** Masked display form — the only thing ever logged or rendered. */
+  masked: string
+}
+
+export interface KeyUsageSnapshot {
+  id: string
+  nickname: string
+  lastFour: string
+  masked: string
+  enabled: boolean
+  health: KeyHealthState
+  cooldownUntil: number
+  cooldownReason: CooldownReason | null
+  requests: number
+  tokensIn: number
+  tokensOut: number
+  lastUsedAt: number
+  /** Requests left in the current minute/day (null = unknown). */
+  rpmRemaining: number | null
+  rpdRemaining: number | null
+  /** Tokens left today (null when the provider publishes no daily allowance). */
+  tpdRemaining: number | null
+  /** The key has a usable secret in memory. */
+  loaded: boolean
+}
+
+export interface KeyPoolOptions {
+  strategy?: 'round-robin' | 'least-used'
+  now?: () => number
+  /** Deterministic jitter source for tests (0..1). */
+  random?: () => number
+  /** Exponential backoff base / cap for transient failures. */
+  backoffBaseMs?: number
+  backoffMaxMs?: number
+  /** Cooldown applied when a quota error carries no reset hint. */
+  quotaFallbackMs?: number
+}
+
+/**
+ * The allowance a run schedules against.
+ *
+ * `quotaScope` decides *how many* allowances there are: `'per-key'` gives every
+ * key its own copy, `'per-provider'` gives the whole provider one copy that all
+ * of its keys share. `tpd` is the daily token ledger — `0` means the provider
+ * does not publish one, which must never block a request.
+ */
+export interface LimitConfig {
+  rpm: number
+  tpm: number
+  rpd: number
+  /** Tokens per day; `0` = unknown. */
+  tpd: number
+  quotaScope: QuotaScope
+}
+
+interface KeyState {
+  seed: KeySeed
+  secret: string | null
+  enabled: boolean
+  nickname: string
+  buckets: KeyBuckets
+  cooldownUntil: number
+  cooldownReason: CooldownReason | null
+  invalid: boolean
+  invalidDetail: string
+  failures: number
+  requests: number
+  tokensIn: number
+  tokensOut: number
+  lastUsedAt: number
+  lastCheckedAt: number | null
+}
+
+const MINUTE_MS = 60_000
+const DAY_MS = 24 * 60 * MINUTE_MS
+
+/**
+ * `tpd: 0` is deliberate: an unknown daily token allowance must not block
+ * anything. `quotaScope` defaults to `'per-key'`, the optimistic reading that
+ * is true for Google AI Studio and OpenRouter keys.
+ */
+export const DEFAULT_LIMITS: LimitConfig = {
+  rpm: 30,
+  tpm: 100_000,
+  rpd: 1_000,
+  tpd: 0,
+  quotaScope: 'per-key',
+}
+
+function emptyBucket(limit: number, now: number, windowMs: number): BucketState {
+  return { limit, used: 0, resetAt: now + windowMs }
+}
+
+function maskOf(lastFour: string): string {
+  return `••••${lastFour || '????'}`
+}
+
+/**
+ * Conservative token estimate for one string.
+ *
+ * Moved to `tokenEstimate.ts`, where it is script-aware (Burmese and other
+ * non-Latin scripts cost far more than the old `len / 3` assumed) and
+ * self-calibrating against the provider's reported `usage`. Re-exported here
+ * because this module's TPM buckets are its main consumer and it is where the
+ * rest of the pipeline has always imported it from.
+ */
+export { estimateTokens } from './tokenEstimate'
+
+export class KeyPool {
+  private readonly keys = new Map<string, KeyState>()
+  private readonly strategy: 'round-robin' | 'least-used'
+  private readonly nowFn: () => number
+  private readonly randomFn: () => number
+  private readonly backoffBaseMs: number
+  private readonly backoffMaxMs: number
+  private readonly quotaFallbackMs: number
+  private limits: LimitConfig = DEFAULT_LIMITS
+  private cursor = 0
+
+  constructor(options: KeyPoolOptions = {}) {
+    this.strategy = options.strategy ?? 'round-robin'
+    this.nowFn = options.now ?? (() => Date.now())
+    this.randomFn = options.random ?? Math.random
+    this.backoffBaseMs = options.backoffBaseMs ?? 2_000
+    this.backoffMaxMs = options.backoffMaxMs ?? 5 * 60_000
+    this.quotaFallbackMs = options.quotaFallbackMs ?? 60 * MINUTE_MS
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Configuration                                                       */
+  /* ------------------------------------------------------------------ */
+
+  /** Replaces the key set (a run starts, or the settings tab edits a key). */
+  setKeys(seeds: KeySeed[]): void {
+    const seen = new Set<string>()
+    const now = this.nowFn()
+    // One bucket set for the whole provider, so that N keys of the same org
+    // draw on ONE allowance instead of N copies of it.
+    const shared = this.limits.quotaScope === 'per-provider' ? this.sharedBuckets(seeds, now) : null
+
+    for (const seed of seeds) {
+      seen.add(seed.id)
+      const existing = this.keys.get(seed.id)
+      if (existing) {
+        existing.seed = seed
+        existing.enabled = seed.enabled
+        existing.nickname = seed.nickname
+        if (seed.secret) existing.secret = seed.secret
+        // Re-point rather than mutate, so a scope change never leaves two keys
+        // sharing a bucket that one of them used to own alone.
+        existing.buckets = this.bucketsFor(seed, shared)
+        continue
+      }
+      this.keys.set(seed.id, {
+        seed,
+        secret: seed.secret,
+        enabled: seed.enabled,
+        nickname: seed.nickname,
+        buckets: this.bucketsFor(seed, shared),
+        cooldownUntil: seed.persisted?.cooldownUntil ?? 0,
+        cooldownReason: seed.persisted?.cooldownReason ?? null,
+        invalid: seed.persisted?.status === 'invalid',
+        invalidDetail: seed.persisted?.statusDetail ?? '',
+        failures: 0,
+        requests: seed.persisted?.requests ?? 0,
+        tokensIn: seed.persisted?.tokensIn ?? 0,
+        tokensOut: seed.persisted?.tokensOut ?? 0,
+        lastUsedAt: seed.persisted?.lastUsedAt ?? 0,
+        lastCheckedAt: seed.persisted?.lastCheckedAt ?? null,
+      })
+    }
+    for (const id of [...this.keys.keys()]) {
+      if (!seen.has(id)) this.keys.delete(id)
+    }
+  }
+
+  /**
+   * Buckets for one key.
+   *
+   * A provider-scoped pool hands every key the **same object**, which is what
+   * makes the allowance counted once however many keys the user configured.
+   * A per-key pool restores each key's own ledger field by field, so a record
+   * written before `tpd` existed simply has no daily token ledger yet.
+   */
+  private bucketsFor(seed: KeySeed, shared: KeyBuckets | null): KeyBuckets {
+    if (shared) return shared
+    const buckets = seed.persisted?.buckets
+    const now = this.nowFn()
+    return {
+      rpm: buckets?.rpm ?? emptyBucket(this.limits.rpm, now, MINUTE_MS),
+      tpm: buckets?.tpm ?? emptyBucket(this.limits.tpm, now, MINUTE_MS),
+      rpd: buckets?.rpd ?? emptyBucket(this.limits.rpd, now, DAY_MS),
+      tpd: buckets?.tpd ?? emptyBucket(this.limits.tpd, now, DAY_MS),
+    }
+  }
+
+  /**
+   * One bucket set standing for the whole provider, seeded from the **widest**
+   * key state.
+   *
+   * Taking the max is the conservative direction: if the user switches a
+   * per-key pool into provider scope, seeding from any single key would
+   * believe the org had spent less than it really has and walk into a 429.
+   */
+  private sharedBuckets(seeds: KeySeed[], now: number): KeyBuckets {
+    const widest = (
+      pick: (buckets: KeyBuckets) => BucketState | undefined,
+      limit: number,
+      windowMs: number,
+    ): BucketState => {
+      let used = 0
+      let resetAt = now + windowMs
+      let ceiling = limit
+      for (const seed of seeds) {
+        const bucket = seed.persisted?.buckets ? pick(seed.persisted.buckets) : undefined
+        if (!bucket) continue
+        if (bucket.used > used) used = bucket.used
+        if (bucket.resetAt > resetAt) resetAt = bucket.resetAt
+        if (bucket.limit > ceiling) ceiling = bucket.limit
+      }
+      return { limit: ceiling, used, resetAt }
+    }
+    return {
+      rpm: widest((buckets) => buckets.rpm, this.limits.rpm, MINUTE_MS),
+      tpm: widest((buckets) => buckets.tpm, this.limits.tpm, MINUTE_MS),
+      rpd: widest((buckets) => buckets.rpd, this.limits.rpd, DAY_MS),
+      tpd: widest((buckets) => buckets.tpd, this.limits.tpd, DAY_MS),
+    }
+  }
+
+  /** True when every key already draws on one and the same bucket set. */
+  private sharesBuckets(): boolean {
+    const sets = [...this.keys.values()].map((key) => key.buckets)
+    return sets.length < 2 || sets.every((set) => set === sets[0])
+  }
+
+  /**
+   * Applies model-configured limits (bucket ceilings follow the model).
+   *
+   * Safe in either order with `setKeys`: the worker configures first, but a
+   * settings change can arrive mid-session. Switching *into* provider scope
+   * re-points every key at one bucket set; switching *out of* it is left alone
+   * rather than silently splitting a shared ledger into optimistic copies.
+   */
+  configureLimits(limits: Partial<LimitConfig>): void {
+    this.limits = { ...this.limits, ...limits }
+    if (this.limits.quotaScope === 'per-provider' && !this.sharesBuckets()) {
+      const shared = this.sharedBuckets(
+        [...this.keys.values()].map((key) => key.seed),
+        this.nowFn(),
+      )
+      for (const key of this.keys.values()) key.buckets = shared
+    }
+    for (const key of this.keys.values()) {
+      key.buckets.rpm.limit = this.limits.rpm
+      key.buckets.tpm.limit = this.limits.tpm
+      key.buckets.rpd.limit = this.limits.rpd
+      key.buckets.tpd.limit = this.limits.tpd
+    }
+  }
+
+  get limitConfig(): LimitConfig {
+    return this.limits
+  }
+
+  size(): number {
+    return this.keys.size
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Selection                                                           */
+  /* ------------------------------------------------------------------ */
+
+  health(keyId: string, now = this.nowFn()): KeyHealthState {
+    const key = this.keys.get(keyId)
+    if (!key) return 'disabled'
+    if (!key.enabled) return 'disabled'
+    if (key.invalid) return 'invalid'
+    if (now < key.cooldownUntil) {
+      return key.cooldownReason === 'quota' ? 'quota-exhausted' : 'cooling-down'
+    }
+    return 'healthy'
+  }
+
+  /** Eligible keys with at least one bucket slot left, in strategy order. */
+  private hasCapacity(key: KeyState, requests: number, tokens: number, now: number): boolean {
+    const { rpm, tpm, rpd, tpd } = key.buckets
+    if (rpm.used + requests > rpm.limit && now < rpm.resetAt) return false
+    if (rpd.used + requests > rpd.limit && now < rpd.resetAt) return false
+    if (tokens > 0 && tpm.used + tokens > tpm.limit && now < tpm.resetAt) return false
+    // Daily token ledger. `limit === 0` means the provider publishes no daily
+    // token allowance — unknown must never be read as zero and block the run.
+    if (tokens > 0 && tpd.limit > 0 && tpd.used + tokens > tpd.limit && now < tpd.resetAt) {
+      return false
+    }
+    return true
+  }
+
+  /**
+   * Next usable key, or `null` when every key is disabled, invalid, cooling or
+   * out of quota capacity.
+   */
+  pick(tokenEstimate = 0, now = this.nowFn()): KeyLease | null {
+    const ordered = [...this.keys.values()].sort((a, b) => a.seed.id.localeCompare(b.seed.id))
+    if (ordered.length === 0) return null
+    const offset = this.cursor % ordered.length
+    const rotated = [...ordered.slice(offset), ...ordered.slice(0, offset)]
+
+    let pool = rotated.filter((key) => this.usable(key, tokenEstimate, now))
+    if (this.strategy === 'least-used') {
+      pool = pool.sort((a, b) => a.requests - b.requests || a.lastUsedAt - b.lastUsedAt)
+    }
+    const chosen = pool[0]
+    if (!chosen) return null
+
+    this.cursor = (this.cursor + 1) % Math.max(1, ordered.length)
+    return {
+      keyId: chosen.seed.id,
+      secret: chosen.secret as string,
+      nickname: chosen.nickname,
+      masked: maskOf(chosen.seed.lastFour),
+    }
+  }
+
+  /** One key's eligibility: enabled, loaded, not invalid, not cooling, bucketed. */
+  private usable(key: KeyState, tokenEstimate: number, now: number): boolean {
+    if (!key.enabled || key.invalid || !key.secret) return false
+    if (now < key.cooldownUntil) return false
+    return this.hasCapacity(key, 1, tokenEstimate, now)
+  }
+
+  /**
+   * True when some key could serve a request right now — **without** touching
+   * rotation state.
+   *
+   * Probes (`waitingDetail`, `isExhausted`, the WAITING banner) used to call
+   * `pick()`, so merely *asking* whether a key was free advanced the
+   * round-robin cursor: a status refresh skewed key selection (O-01).
+   */
+  canPick(tokenEstimate = 0, now = this.nowFn()): boolean {
+    for (const key of this.keys.values()) {
+      if (this.usable(key, tokenEstimate, now)) return true
+    }
+    return false
+  }
+
+  /**
+   * Epoch ms when a key may become available, or `null` when one is usable
+   * right now. Used directly for the WAITING_RATE_LIMIT countdown.
+   */
+  availableAt(tokenEstimate = 0, now = this.nowFn()): number | null {
+    return this.waitingDetail(tokenEstimate, now)?.until ?? null
+  }
+
+  /**
+   * The deadline nothing can run before, and *which window set it*.
+   *
+   * The banner used to call every wait "daily" whatever had blocked it, which
+   * is how a one-hour fallback guess (`quotaFallbackMs`) got shown to the user
+   * as a lost day — and sent them adding keys that could never have helped.
+   *
+   * Ties resolve towards the more informative window. Two rules do that:
+   * candidates are offered day → minute → cooldown, and an equal deadline keeps
+   * whichever window already ranks higher — so a bucket that shares the reset
+   * `reportRateLimit` copied into `cooldownUntil` still reads as the window the
+   * provider named rather than as our bare backoff.
+   */
+  waitingDetail(tokenEstimate = 0, now = this.nowFn()): WaitDetail | null {
+    if (this.canPick(tokenEstimate, now)) return null
+    let best: WaitDetail | null = null
+    const consider = (until: number | undefined, window: WaitWindow): void => {
+      if (typeof until !== 'number' || until <= now) return
+      const earlier = best === null || until < best.until
+      const sameButClearer =
+        best !== null && until === best.until && WINDOW_RANK[window] < WINDOW_RANK[best.window]
+      if (earlier || sameButClearer) best = { until, window }
+    }
+
+    for (const key of this.keys.values()) {
+      if (!key.enabled || key.invalid || !key.secret) continue
+      const { rpm, rpd, tpm, tpd } = key.buckets
+      if (rpd.used + 1 > rpd.limit) consider(rpd.resetAt, 'day')
+      if (tpd.limit > 0 && tokenEstimate > 0 && tpd.used + tokenEstimate > tpd.limit) {
+        consider(tpd.resetAt, 'day')
+      }
+      if (rpm.used + 1 > rpm.limit) consider(rpm.resetAt, 'minute')
+      if (tokenEstimate > 0 && tpm.used + tokenEstimate > tpm.limit) {
+        consider(tpm.resetAt, 'minute')
+      }
+      consider(key.cooldownUntil, 'cooldown')
+    }
+
+    return best
+  }
+
+  /** Cooldown (epoch ms) when every key is cooling/quota-bound, else null. */
+  waitingUntil(now = this.nowFn()): number | null {
+    return this.availableAt(0, now)
+  }
+
+  /**
+   * Drops every backoff this pool guessed at, and reports how many it touched.
+   *
+   * Only the *guessed* windows go: the RPM/TPM/RPD buckets are the provider's
+   * own counters, they stay exactly where they are, so a "Try now" can only
+   * spend what the provider still allows. A key rejected outright is left
+   * alone too — retrying a dead key on demand buys nothing.
+   *
+   * @returns the number of keys that were cooling.
+   */
+  clearCooldowns(): number {
+    let cleared = 0
+    for (const key of this.keys.values()) {
+      if (key.cooldownUntil === 0 && key.cooldownReason === null) continue
+      key.cooldownUntil = 0
+      key.cooldownReason = null
+      cleared += 1
+    }
+    return cleared
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Reporting                                                           */
+  /* ------------------------------------------------------------------ */
+
+  private consume(key: KeyState, tokens: number, now: number): void {
+    const roll = (bucket: BucketState, windowMs: number, amount: number): void => {
+      if (now >= bucket.resetAt) {
+        bucket.used = 0
+        bucket.resetAt = now + windowMs
+      }
+      bucket.used += amount
+    }
+    roll(key.buckets.rpm, MINUTE_MS, 1)
+    roll(key.buckets.rpd, DAY_MS, 1)
+    if (tokens > 0) {
+      roll(key.buckets.tpm, MINUTE_MS, tokens)
+      // The daily ledger is kept accurate even when the ceiling is unknown, so
+      // a limit that arrives later does not start from a false zero.
+      roll(key.buckets.tpd, DAY_MS, tokens)
+    }
+    key.requests += 1
+    key.lastUsedAt = now
+    key.lastCheckedAt = now
+  }
+
+  reportSuccess(
+    keyId: string,
+    input: {
+      tokensIn?: number
+      tokensOut?: number
+      rate?: RateLimitInfo | null
+      now?: number
+    } = {},
+  ): void {
+    const key = this.keys.get(keyId)
+    if (!key) return
+    const now = input.now ?? this.nowFn()
+    this.consume(key, input.tokensIn ?? 0, now)
+    key.tokensIn += input.tokensIn ?? 0
+    key.tokensOut += input.tokensOut ?? 0
+    key.failures = 0
+    key.cooldownUntil = 0
+    key.cooldownReason = null
+    this.applyRateInfo(key, input.rate ?? null, now)
+  }
+
+  /**
+   * 429 / quota → cooldown. A burst gets exponential backoff + jitter (raised
+   * to the server's `Retry-After`/token-window deadline when it gave one); a
+   * quota parks on the server's deadline or, absent any hint, on the
+   * `quotaFallbackMs` guess. Returns the cooldown deadline.
+   */
+  reportRateLimit(
+    keyId: string,
+    input: {
+      retryAfterMs?: number | null
+      quota?: boolean
+      rate?: RateLimitInfo | null
+      now?: number
+    } = {},
+  ): number {
+    const key = this.keys.get(keyId)
+    const now = input.now ?? this.nowFn()
+    if (!key) return now
+
+    const rate = input.rate ?? null
+    const retryAfter = input.retryAfterMs ?? rate?.retryAfterMs ?? null
+    const quota = input.quota ?? false
+
+    key.failures += 1
+    let cooldown: number
+    if (quota) {
+      // A quota parks on the **server's** deadline whenever the provider named
+      // one — `Retry-After` first, then either window reset — and only guesses
+      // `quotaFallbackMs` when it gave us nothing to go on. The server is
+      // authoritative in both directions: a quota 429 that says "retry after
+      // 60s" is a one-minute wait, not the hour our fallback used to force
+      // (L-04), and a reset an hour out still outranks the fallback (as
+      // before). Only the *guess* gets ±25% jitter, so parallel workers do
+      // not stampede back onto the key.
+      const serverMs =
+        (retryAfter !== null && retryAfter > 0 ? retryAfter : 0) ||
+        (rate?.resetAt != null && rate.resetAt > now ? rate.resetAt - now : 0) ||
+        (rate?.tokensResetAt != null && rate.tokensResetAt > now ? rate.tokensResetAt - now : 0)
+      cooldown =
+        serverMs > 0
+          ? serverMs
+          : Math.round(this.quotaFallbackMs * (0.75 + this.randomFn() * 0.5))
+    } else {
+      // Burst backoff: exponential + jitter, with the server's own deadlines
+      // layered on in order of authority:
+      //  1. `Retry-After` — an explicit mandate, never shortened;
+      //  2. the token-window reset — Groq stamps `x-ratelimit-reset-tokens`
+      //     (~1s) even while a streak of 429s inflates our backoff into the
+      //     minutes; the token bucket, not the backoff, paces the retry, so the
+      //     window deadline caps the guess (floor 1s so a deadline already past
+      //     cannot become a hot loop).
+      cooldown = Math.min(
+        this.backoffMaxMs,
+        this.backoffBaseMs * 2 ** Math.min(8, key.failures - 1),
+      )
+      cooldown = Math.round(cooldown * (0.75 + this.randomFn() * 0.5))
+      if (retryAfter !== null && retryAfter > 0) cooldown = Math.max(cooldown, retryAfter)
+      else if (rate?.tokensResetAt) {
+        cooldown = Math.min(cooldown, Math.max(rate.tokensResetAt - now, 1_000))
+      }
+    }
+
+    key.cooldownUntil = now + cooldown
+    key.cooldownReason = quota ? 'quota' : 'rate_limit'
+    key.lastCheckedAt = now
+    this.applyRateInfo(key, rate, now)
+    return key.cooldownUntil
+  }
+
+  /** 5xx / timeout: short backoff, the key itself is still good. */
+  reportTransient(keyId: string, now = this.nowFn()): number {
+    const key = this.keys.get(keyId)
+    if (!key) return now
+    key.failures += 1
+    const cooldown = Math.min(
+      this.backoffMaxMs,
+      Math.round(
+        this.backoffBaseMs * 2 ** Math.min(6, key.failures - 1) * (0.75 + this.randomFn() * 0.5),
+      ),
+    )
+    key.cooldownUntil = now + cooldown
+    key.cooldownReason = 'server'
+    key.lastCheckedAt = now
+    return key.cooldownUntil
+  }
+
+  /** 401/403 — the key is dead until the user fixes it. */
+  markInvalid(keyId: string, detail = '', now = this.nowFn()): void {
+    const key = this.keys.get(keyId)
+    if (!key) return
+    key.invalid = true
+    key.invalidDetail = detail
+    key.lastCheckedAt = now
+    key.cooldownUntil = 0
+    key.cooldownReason = null
+  }
+
+  markValid(keyId: string, now = this.nowFn()): void {
+    const key = this.keys.get(keyId)
+    if (!key) return
+    key.invalid = false
+    key.invalidDetail = ''
+    key.failures = 0
+    key.cooldownUntil = 0
+    key.cooldownReason = null
+    key.lastCheckedAt = now
+  }
+
+  markEnabled(keyId: string, enabled: boolean): void {
+    const key = this.keys.get(keyId)
+    if (key) key.enabled = enabled
+  }
+
+  setSecret(keyId: string, secret: string | null): void {
+    const key = this.keys.get(keyId)
+    if (key) key.secret = secret
+  }
+
+  /** Live headers win over the bundled estimates. */
+  private applyRateInfo(key: KeyState, rate: RateLimitInfo | null, now: number): void {
+    if (!rate) return
+    if (rate.limit !== null && rate.limit > 0) key.buckets.rpm.limit = rate.limit
+    if (rate.tokensLimit !== null && rate.tokensLimit > 0) key.buckets.tpm.limit = rate.tokensLimit
+    if (rate.remaining !== null && rate.limit !== null) {
+      const window = Math.max(rate.resetAt ?? now + MINUTE_MS, now)
+      key.buckets.rpm.used = Math.max(0, rate.limit - rate.remaining)
+      key.buckets.rpm.resetAt = window
+    }
+    if (rate.tokensRemaining !== null && rate.tokensLimit !== null) {
+      // The token window carries its own reset header; the requests reset
+      // (Groq stamps ~1h on every response) must never pace the token bucket —
+      // doing so parked a healthy key for over an hour after a routine TPM 429.
+      const window = Math.max(rate.tokensResetAt ?? now + MINUTE_MS, now)
+      key.buckets.tpm.used = Math.max(0, rate.tokensLimit - rate.tokensRemaining)
+      key.buckets.tpm.resetAt = window
+    }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Introspection / persistence                                         */
+  /* ------------------------------------------------------------------ */
+
+  usage(keyId: string): KeyUsageSnapshot | null {
+    const key = this.keys.get(keyId)
+    if (!key) return null
+    return this.snapshotOf(key, this.nowFn())
+  }
+
+  snapshot(now = this.nowFn()): KeyUsageSnapshot[] {
+    return [...this.keys.values()]
+      .sort((a, b) => a.seed.id.localeCompare(b.seed.id))
+      .map((key) => this.snapshotOf(key, now))
+  }
+
+  private snapshotOf(key: KeyState, now: number): KeyUsageSnapshot {
+    const rpmWindow =
+      key.buckets.rpm.resetAt > now
+        ? key.buckets.rpm.limit - key.buckets.rpm.used
+        : key.buckets.rpm.limit
+    const rpdWindow =
+      key.buckets.rpd.resetAt > now
+        ? key.buckets.rpd.limit - key.buckets.rpd.used
+        : key.buckets.rpd.limit
+    const tpdWindow =
+      key.buckets.tpd.resetAt > now
+        ? key.buckets.tpd.limit - key.buckets.tpd.used
+        : key.buckets.tpd.limit
+    return {
+      id: key.seed.id,
+      nickname: key.nickname,
+      lastFour: key.seed.lastFour,
+      masked: maskOf(key.seed.lastFour),
+      enabled: key.enabled,
+      health: this.health(key.seed.id, now),
+      cooldownUntil: key.cooldownUntil,
+      cooldownReason: key.cooldownReason,
+      requests: key.requests,
+      tokensIn: key.tokensIn,
+      tokensOut: key.tokensOut,
+      lastUsedAt: key.lastUsedAt,
+      rpmRemaining: Math.max(0, rpmWindow),
+      rpdRemaining: Math.max(0, rpdWindow),
+      // `null` when the provider publishes no daily token allowance.
+      tpdRemaining: key.buckets.tpd.limit > 0 ? Math.max(0, tpdWindow) : null,
+      loaded: Boolean(key.secret),
+    }
+  }
+
+  /** The slice of state that must survive a refresh. */
+  persisted(keyId: string): PersistedKeyState | null {
+    const key = this.keys.get(keyId)
+    if (!key) return null
+    const now = this.nowFn()
+    const health = this.health(keyId, now)
+    return {
+      id: key.seed.id,
+      enabled: key.enabled,
+      status: key.invalid
+        ? 'invalid'
+        : health === 'quota-exhausted'
+          ? 'quota'
+          : health === 'cooling-down'
+            ? 'cooling'
+            : key.lastCheckedAt === null
+              ? 'unknown'
+              : 'valid',
+      statusDetail: key.invalidDetail,
+      cooldownUntil: key.cooldownUntil,
+      cooldownReason: key.cooldownReason,
+      lastCheckedAt: key.lastCheckedAt,
+      requests: key.requests,
+      tokensIn: key.tokensIn,
+      tokensOut: key.tokensOut,
+      lastUsedAt: key.lastUsedAt,
+      buckets: {
+        rpm: { ...key.buckets.rpm },
+        tpm: { ...key.buckets.tpm },
+        rpd: { ...key.buckets.rpd },
+        tpd: { ...key.buckets.tpd },
+      },
+    }
+  }
+
+  persistedAll(): PersistedKeyState[] {
+    return [...this.keys.keys()]
+      .map((id) => this.persisted(id))
+      .filter((state): state is PersistedKeyState => state !== null)
+  }
+
+  /** True when no usable key exists at all (the run cannot make progress). */
+  hasUsableKey(): boolean {
+    for (const key of this.keys.values()) {
+      if (key.enabled && key.secret && !key.invalid) return true
+    }
+    return false
+  }
+
+  /** True when at least one key exists but none is usable right now. */
+  isExhausted(now = this.nowFn()): boolean {
+    return this.keys.size > 0 && !this.canPick(0, now)
+  }
+
+  /** Reason code for a run that cannot proceed. */
+  exhaustionReason(
+    now = this.nowFn(),
+  ): 'ALL_KEYS_COOLING_DOWN' | 'QUOTA_EXHAUSTED' | 'INVALID_KEY' | 'NO_API_KEY' {
+    if (this.keys.size === 0) return 'NO_API_KEY'
+    let anyQuota = false
+    let anyCooldown = false
+    let anyInvalid = false
+    let anyBucketed = false
+    for (const key of this.keys.values()) {
+      if (!key.enabled) continue
+      if (key.invalid) {
+        anyInvalid = true
+        continue
+      }
+      if (!key.secret) continue
+      if (now < key.cooldownUntil) {
+        if (key.cooldownReason === 'quota') anyQuota = true
+        else anyCooldown = true
+        continue
+      }
+      // Usable key, but every bucket may still be full (rpm/rpd exhausted).
+      anyBucketed = true
+    }
+    if (anyQuota) return 'QUOTA_EXHAUSTED'
+    if (anyCooldown || anyBucketed) return 'ALL_KEYS_COOLING_DOWN'
+    return anyInvalid ? 'INVALID_KEY' : 'NO_API_KEY'
+  }
+}

@@ -1,0 +1,669 @@
+import JSZip from 'jszip'
+import { describe, expect, it } from 'vitest'
+import type { FigureRef } from '@/pdf/structure'
+import { buildEpub, type EpubOptions } from './epub'
+import type { ExportBlock, ExportDocument, ExportPage } from './types'
+
+/** A traced figure for a page-space box, at the 2× the fixtures were rendered at. */
+function ref(bbox: { x: number; y: number; w: number; h: number }): FigureRef {
+  return { bbox, pixelWidth: bbox.w * 2, pixelHeight: bbox.h * 2 }
+}
+
+function block(partial: Partial<ExportBlock>): ExportBlock {
+  return {
+    id: 'block',
+    order: 0,
+    kind: 'paragraph',
+    region: 'body',
+    status: 'translated',
+    alignment: 'left',
+    x: 10,
+    y: 20,
+    width: 500,
+    height: 24,
+    fontFamily: 'Noto Sans',
+    fontSize: 12,
+    lineHeight: 1.5,
+    color: '#000000',
+    bold: false,
+    italic: false,
+    listMarker: null,
+    headingLevel: null,
+    links: [],
+    figures: [],
+    tableCells: null,
+    tableSpans: null,
+    sourceText: '',
+    translatedText: '',
+    characterCount: 0,
+    skipRule: null,
+    placeholders: [],
+    direction: 'ltr',
+    fittedFontSize: null,
+    overflow: false,
+    hasSuggestion: false,
+    ...partial,
+  }
+}
+
+function page(index: number, blocks: ExportBlock[]): ExportPage {
+  return { index, width: 595, height: 842, rotation: 0, contentClass: 'text', blocks }
+}
+
+/** Two pages covering Latin, Myanmar, RTL, list, escaping and a raw source. */
+function fixtureDoc(): ExportDocument {
+  return {
+    schema: 1,
+    projectId: 'prj_epub',
+    title: 'မြန်မာစာ စာအုပ်',
+    sourceFileName: 'sample.pdf',
+    sourceLang: 'en',
+    targetLang: 'my',
+    pageCount: 2,
+    exportedAt: 1_760_000_000_000,
+    templateId: null,
+    pages: [
+      page(0, [
+        block({
+          id: 'latin',
+          sourceText: 'Hello world',
+          translatedText: 'မြန်မာစာ ကြိုဆိုပါသည်',
+        }),
+        block({
+          id: 'arabic',
+          order: 1,
+          sourceText: 'Welcome',
+          translatedText: 'مرحبا بالعالم',
+          alignment: 'right',
+        }),
+        block({
+          id: 'list',
+          order: 2,
+          listMarker: '1.',
+          sourceText: 'First point',
+          translatedText: 'ပထမအချက်',
+        }),
+        block({
+          id: 'escaping',
+          order: 3,
+          sourceText: 'Fish & chips <b>bold</b>',
+          translatedText: 'ငါးနှင့် အသုပ်',
+        }),
+        block({ id: 'empty', order: 4, sourceText: '', translatedText: '' }),
+      ]),
+      page(1, [
+        block({ id: 'p2', sourceText: 'Page two source', translatedText: 'စာမျက်နှာနှစ်' }),
+      ]),
+    ],
+  }
+}
+
+function epubOptions(overrides: Partial<EpubOptions> = {}): EpubOptions {
+  return {
+    title: 'မြန်မာစာ စာအုပ်',
+    author: 'AI Documents Translator',
+    lang: 'my',
+    includeOriginal: false,
+    fontStack: '"Noto Sans Myanmar", "Padauk", sans-serif',
+    ...overrides,
+  }
+}
+
+async function zipText(zip: JSZip, path: string): Promise<string> {
+  const entry = zip.file(path)
+  if (!entry) throw new Error(`missing zip entry: ${path}`)
+  return entry.async('string')
+}
+
+function expectWellFormed(xml: string, label: string): void {
+  const parsed = new DOMParser().parseFromString(xml, 'application/xml')
+  const errors = Array.from(parsed.getElementsByTagName('parsererror'))
+  expect(
+    errors.map((error) => error.textContent),
+    `${label} must be well-formed XML`,
+  ).toEqual([])
+}
+
+describe('buildEpub', () => {
+  it('starts with an uncompressed mimetype entry holding the exact media type', async () => {
+    const bytes = await buildEpub(fixtureDoc(), epubOptions())
+    expect(bytes).toBeInstanceOf(Uint8Array)
+
+    const zip = await JSZip.loadAsync(bytes)
+    expect(await zipText(zip, 'mimetype')).toBe('application/epub+zip')
+
+    // Local file header of the first entry: signature, method, name.
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    expect(view.getUint32(0, true)).toBe(0x04034b50)
+    expect(view.getUint16(8, true)).toBe(0) // 0 = STORE
+    const nameLength = view.getUint16(26, true)
+    const name = String.fromCharCode(...bytes.subarray(30, 30 + nameLength))
+    expect(name).toBe('mimetype')
+  })
+
+  it('points the container document at OEBPS/content.opf', async () => {
+    const zip = await JSZip.loadAsync(await buildEpub(fixtureDoc(), epubOptions()))
+    const container = zip.file('META-INF/container.xml')
+    expect(container).not.toBeNull()
+    const xml = await zipText(zip, 'META-INF/container.xml')
+    expect(xml).toContain('OEBPS/content.opf')
+    expect(xml).toContain('urn:oasis:names:tc:opendocument:xmlns:container')
+  })
+
+  it('writes a package document with metadata, manifest and spine', async () => {
+    const zip = await JSZip.loadAsync(await buildEpub(fixtureDoc(), epubOptions()))
+    expect(zip.file('OEBPS/content.opf')).not.toBeNull()
+
+    const opf = await zipText(zip, 'OEBPS/content.opf')
+    expect(opf).toContain('<dc:title>မြန်မာစာ စာအုပ်</dc:title>')
+    expect(opf).toContain('<dc:language>my</dc:language>')
+    expect(opf).toContain('<dc:creator>AI Documents Translator</dc:creator>')
+    expect(opf).toMatch(
+      /<meta property="dcterms:modified">\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z<\/meta>/,
+    )
+    expect(opf).toContain('<item ')
+    expect(opf).toContain('properties="nav"')
+    expect(opf).toContain('<itemref ')
+  })
+
+  it('lists every chapter in the EPUB 3 navigation document', async () => {
+    const zip = await JSZip.loadAsync(await buildEpub(fixtureDoc(), epubOptions()))
+    const nav = await zipText(zip, 'OEBPS/nav.xhtml')
+    expect(nav).toContain('epub="toc"')
+    expect(nav).toContain('href="text/chap_1.xhtml"')
+    expect(nav).toContain('Page 1')
+  })
+
+  it('renders Myanmar verbatim and RTL blocks with dir="rtl" in chapters', async () => {
+    const zip = await JSZip.loadAsync(await buildEpub(fixtureDoc(), epubOptions()))
+    expect(zip.file('OEBPS/text/chap_1.xhtml')).not.toBeNull()
+
+    const chapter = await zipText(zip, 'OEBPS/text/chap_1.xhtml')
+    expect(chapter).toContain('မြန်မာစာ')
+    expect(chapter).toContain('dir="rtl"')
+    expect(chapter).toContain('class="block rtl"')
+    expect(chapter).toContain('<h2 id="page-1">Page 1</h2>')
+    expect(chapter).toContain('<h2 id="page-2">Page 2</h2>')
+    expect(chapter).toContain('1. ပထမအချက်')
+  })
+
+  it('escapes user text and puts the source paragraph first with includeOriginal', async () => {
+    const zip = await JSZip.loadAsync(
+      await buildEpub(fixtureDoc(), epubOptions({ includeOriginal: true })),
+    )
+    const chapter = await zipText(zip, 'OEBPS/text/chap_1.xhtml')
+    expect(chapter).toContain('Fish &amp; chips &lt;b&gt;bold&lt;/b&gt;')
+    expect(chapter).toContain('class="source block"')
+    expect(chapter.indexOf('Hello world')).toBeLessThan(chapter.indexOf('မြန်မာစာ ကြိုဆိုပါသည်'))
+
+    const mono = await JSZip.loadAsync(await buildEpub(fixtureDoc(), epubOptions()))
+    const monoChapter = await zipText(mono, 'OEBPS/text/chap_1.xhtml')
+    expect(monoChapter).not.toContain('Hello world')
+    expect(monoChapter).not.toContain('class="source')
+  })
+
+  it('groups at most 20 pages per chapter', async () => {
+    const wide: ExportDocument = {
+      ...fixtureDoc(),
+      pageCount: 25,
+      pages: Array.from({ length: 25 }, (_, index) =>
+        page(index, [
+          block({
+            id: `p${index}`,
+            sourceText: `Source ${index + 1}`,
+            translatedText: `မြန်မာစာ ${index + 1}`,
+          }),
+        ]),
+      ),
+    }
+    const zip = await JSZip.loadAsync(await buildEpub(wide, epubOptions()))
+    expect(zip.file('OEBPS/text/chap_1.xhtml')).not.toBeNull()
+    expect(zip.file('OEBPS/text/chap_2.xhtml')).not.toBeNull()
+    expect(zip.file('OEBPS/text/chap_3.xhtml')).toBeNull()
+
+    const nav = await zipText(zip, 'OEBPS/nav.xhtml')
+    expect(nav).toContain('Page 1–20')
+    expect(nav).toContain('Page 21–25')
+  })
+
+  it('embeds fonts as base64 @font-face rules and keeps the Myanmar stack', async () => {
+    const zip = await JSZip.loadAsync(
+      await buildEpub(
+        fixtureDoc(),
+        epubOptions({
+          fonts: [{ fileName: 'Padauk Test.woff2', mimeType: 'font/woff2', base64: 'd09GMg==' }],
+        }),
+      ),
+    )
+    const css = await zipText(zip, 'OEBPS/css/main.css')
+    expect(css).toContain('@font-face')
+    expect(css).toContain('url(data:font/woff2;base64,d09GMg==)')
+    expect(css).toContain('font-family: "Padauk Test"')
+    expect(css).toContain('font-family: "Noto Sans Myanmar", "Padauk", sans-serif')
+    expect(css).toContain('line-height: 1.7')
+    expect(css).toContain('direction: rtl')
+    expect(css).toContain('font-size: 0.9em')
+  })
+
+  it('emits well-formed XML for every textual part', async () => {
+    const zip = await JSZip.loadAsync(
+      await buildEpub(fixtureDoc(), epubOptions({ includeOriginal: true })),
+    )
+    expectWellFormed(await zipText(zip, 'META-INF/container.xml'), 'container.xml')
+    expectWellFormed(await zipText(zip, 'OEBPS/content.opf'), 'content.opf')
+    expectWellFormed(await zipText(zip, 'OEBPS/nav.xhtml'), 'nav.xhtml')
+    expectWellFormed(await zipText(zip, 'OEBPS/text/chap_1.xhtml'), 'chap_1.xhtml')
+  })
+
+  it('nests a document heading under the per-page heading', async () => {
+    const doc: ExportDocument = {
+      ...fixtureDoc(),
+      pages: [
+        page(0, [
+          block({
+            id: 'sec',
+            kind: 'heading',
+            headingLevel: 1,
+            sourceText: 'Chapter One',
+            translatedText: 'အချက်တစ်ခု',
+          }),
+          block({ id: 'body', order: 1, sourceText: 'Body copy', translatedText: 'ကိုယ်ထည်' }),
+        ]),
+      ],
+    }
+    const zip = await JSZip.loadAsync(await buildEpub(doc, epubOptions()))
+    const chapter = await zipText(zip, 'OEBPS/text/chap_1.xhtml')
+
+    // Each page opens at h2, so the document's own hierarchy starts at h3.
+    expect(chapter).toContain('<h2 id="page-1">Page 1</h2>')
+    expect(chapter).toContain('<h3 class="block" xml:lang="my" lang="my"')
+    expect(chapter).toContain('>အချက်တစ်ခု</h3>')
+    // A body block is still a paragraph, and only one outline entry is added
+    // per heading even though the source and the translation both exist.
+    expect(chapter).toContain('<p class="block"')
+    expect(chapter.match(/<h3 /g)).toHaveLength(1)
+    expectWellFormed(chapter, 'chap_1.xhtml')
+  })
+})
+
+describe('buildEpub links', () => {
+  async function chapterOf(
+    links: ExportBlock['links'],
+    text = 'See the pricing page for details.',
+  ) {
+    const doc: ExportDocument = {
+      ...fixtureDoc(),
+      pages: [page(0, [block({ id: 'linked', links, sourceText: text, translatedText: text })])],
+    }
+    const zip = await JSZip.loadAsync(await buildEpub(doc, epubOptions()))
+    return zipText(zip, 'OEBPS/text/chap_1.xhtml')
+  }
+
+  it('emits an <a> whose label and href are both escaped', async () => {
+    const chapter = await chapterOf([
+      { text: 'pricing page', url: 'https://example.com/pricing?x=1&y=2' },
+    ])
+    expect(chapter).toContain('<a href="https://example.com/pricing?x=1&amp;y=2">pricing page</a>')
+    expectWellFormed(chapter, 'chap_1.xhtml')
+  })
+
+  it('keeps the chapter well-formed when the text itself needs escaping', async () => {
+    const chapter = await chapterOf(
+      [{ text: 'Click me', url: 'https://example.com/a?b=1&c=2' }],
+      'Tom & Jerry <3 say Click me',
+    )
+    expect(chapter).toContain('Tom &amp; Jerry &lt;3 say ')
+    expectWellFormed(chapter, 'chap_1.xhtml')
+  })
+
+  it('drops a link whose URL would not be safe to navigate', async () => {
+    const chapter = await chapterOf(
+      [{ text: 'Click me', url: 'javascript:alert(1)' }],
+      'Click me now',
+    )
+    expect(chapter).not.toContain('javascript:')
+    expect(chapter).toContain('Click me now')
+    expectWellFormed(chapter, 'chap_1.xhtml')
+  })
+
+  it('writes no <a> at all for a block with no links', async () => {
+    const chapter = await chapterOf([])
+    expect(chapter).not.toContain('<a href=')
+  })
+
+  it('gives every page heading an id and jumps to it in-chapter', async () => {
+    const chapter = await chapterOf(
+      [{ text: 'Introduction', url: '', destPage: 0 }],
+      'See Introduction for the background.',
+    )
+    expect(chapter).toContain('<h2 id="page-1">Page 1</h2>')
+    expect(chapter).toContain('<a href="#page-1">Introduction</a>')
+    expectWellFormed(chapter, 'chap_1.xhtml')
+  })
+
+  it('prefixes the owning chapter when the jump crosses one', async () => {
+    // 21 pages: chapters hold 20, so page 21 lives in chapter 2 and a bare
+    // `#page-21` from chapter 1 would resolve against a file that has no
+    // such id. Every page needs a block of its own or `contentPages` drops
+    // it and the chaptering changes.
+    const linked = block({
+      id: 'linked',
+      links: [{ text: 'Appendix', url: '', destPage: 20 }],
+      sourceText: 'See the Appendix.',
+      translatedText: 'See the Appendix.',
+    })
+    const doc: ExportDocument = {
+      ...fixtureDoc(),
+      pages: Array.from({ length: 21 }, (_, index) =>
+        page(
+          index,
+          index === 0
+            ? [linked]
+            : [
+                block({
+                  id: `filler-${index}`,
+                  sourceText: `Filler ${index}`,
+                  translatedText: `Filler ${index}`,
+                }),
+              ],
+        ),
+      ),
+    }
+    const zip = await JSZip.loadAsync(await buildEpub(doc, epubOptions()))
+    const chapter1 = await zipText(zip, 'OEBPS/text/chap_1.xhtml')
+    expect(chapter1).toContain('<a href="chap_2.xhtml#page-21">Appendix</a>')
+    expectWellFormed(chapter1, 'chap_1.xhtml')
+    // …and the anchor it names does exist, in chapter 2.
+    const chapter2 = await zipText(zip, 'OEBPS/text/chap_2.xhtml')
+    expect(chapter2).toContain('<h2 id="page-21">Page 21</h2>')
+    expectWellFormed(chapter2, 'chap_2.xhtml')
+  })
+})
+
+describe('buildEpub code blocks', () => {
+  async function codeChapter(overrides: Partial<ExportBlock> = {}) {
+    const doc: ExportDocument = {
+      ...fixtureDoc(),
+      pages: [
+        page(0, [
+          block({
+            id: 'snippet',
+            kind: 'code',
+            status: 'skipped',
+            skipRule: 'code',
+            fontFamily: 'Courier',
+            sourceText: 'if (a) {\n  b = 2;\n}',
+            ...overrides,
+          }),
+        ]),
+      ],
+    }
+    const zip = await JSZip.loadAsync(await buildEpub(doc, epubOptions()))
+    return zipText(zip, 'OEBPS/text/chap_1.xhtml')
+  }
+
+  it('emits a <pre> so the line breaks do not collapse into spaces', async () => {
+    const chapter = await codeChapter()
+    expect(chapter).toContain('<pre class="block"')
+    // The snippet arrives token by token (see export/highlight.ts), so the
+    // text is read back out of the spans: `if` and `2` are painted, and the
+    // newlines still sit literally inside the runs the way they printed.
+    expect(chapter).toContain(
+      '<span class="tok-k">if</span> (a) {\n  b = <span class="tok-n">2</span>;\n}',
+    )
+    expectWellFormed(chapter, 'chap_1.xhtml')
+  })
+
+  it('sets the snippet in the monospace stack', async () => {
+    const chapter = await codeChapter()
+    expect(chapter).toContain('font-family: &quot;Courier New&quot;')
+  })
+
+  it('ships the token palette in the chapter stylesheet', async () => {
+    const doc: ExportDocument = {
+      ...fixtureDoc(),
+      pages: [
+        page(0, [
+          block({
+            id: 'snippet',
+            kind: 'code',
+            status: 'skipped',
+            skipRule: 'code',
+            fontFamily: 'Courier',
+            sourceText: 'const a = 1;',
+          }),
+        ]),
+      ],
+    }
+    const zip = await JSZip.loadAsync(await buildEpub(doc, epubOptions()))
+    const css = await zipText(zip, 'OEBPS/css/main.css')
+    expect(css).toContain('.tok-k { color: #0000FF; }')
+    expect(css).toContain('.tok-c { color: #008000; }')
+    expect(css).toContain('.tok-s { color: #A31515; }')
+  })
+
+  it('leaves a URL inside the snippet as data rather than an anchor', async () => {
+    const chapter = await codeChapter({
+      sourceText: 'fetch("https://example.com")',
+      links: [{ text: 'https://example.com', url: 'https://example.com' }],
+    })
+    // The URL paints as a string token — and still opens nothing.
+    expect(chapter).toContain(
+      '<span class="tok-f">fetch</span>(<span class="tok-s">&quot;https://example.com&quot;</span>)</pre>',
+    )
+    expect(chapter).not.toContain('<a href=')
+    expectWellFormed(chapter, 'chap_1.xhtml')
+  })
+
+  it('does not prefix the document bullet into the program', async () => {
+    const chapter = await codeChapter({ sourceText: 'const a = 1;', listMarker: '•' })
+    expect(chapter).toContain(
+      '<span class="tok-k">const</span> a = <span class="tok-n">1</span>;</pre>',
+    )
+    expect(chapter).not.toContain('•const')
+    expect(chapter).not.toContain('•<span')
+  })
+})
+
+describe('buildEpub tables', () => {
+  /** A table whose header was drawn across two of its three columns. */
+  const MERGED = 'Region \t First half 2026 \t \nNorth \t 120 \t 150'
+  const MERGED_CELLS = [
+    ['Region', 'First half 2026', ''],
+    ['North', '120', '150'],
+  ]
+  const MERGED_SPANS = [
+    [1, 2, 0],
+    [1, 1, 1],
+  ]
+
+  async function tableChapter(overrides: Partial<ExportBlock> = {}) {
+    const doc: ExportDocument = {
+      ...fixtureDoc(),
+      pages: [
+        page(0, [
+          block({
+            id: 'tbl',
+            kind: 'table',
+            sourceText: 'Name \t Value\nAlpha \t 12',
+            translatedText: 'Name \t Value\nAlpha \t 12',
+            tableCells: [
+              ['Name', 'Value'],
+              ['Alpha', '12'],
+            ],
+            ...overrides,
+          }),
+        ]),
+      ],
+    }
+    const zip = await JSZip.loadAsync(await buildEpub(doc, epubOptions()))
+    return zipText(zip, 'OEBPS/text/chap_1.xhtml')
+  }
+
+  it('emits a real table whose cells are td elements', async () => {
+    const chapter = await tableChapter()
+    expect(chapter).toContain('<table')
+    expect(chapter).toContain('<tr><td>Name</td><td>Value</td></tr>')
+    expect(chapter).toContain('<tr><td>Alpha</td><td>12</td></tr>')
+    expectWellFormed(chapter, 'chap_1.xhtml')
+  })
+
+  it('merges a cell across the columns it covers and never draws them', async () => {
+    const chapter = await tableChapter({
+      sourceText: MERGED,
+      translatedText: MERGED,
+      tableCells: MERGED_CELLS,
+      tableSpans: MERGED_SPANS,
+    })
+    expect(chapter).toContain('<tr><td>Region</td><td colspan="2">First half 2026</td></tr>')
+    expect(chapter).toContain('<tr><td>North</td><td>120</td><td>150</td></tr>')
+    expectWellFormed(chapter, 'chap_1.xhtml')
+  })
+
+  it('drops the merge when the printed grid is no longer that shape', async () => {
+    const chapter = await tableChapter({
+      translatedText: 'Region \t First half 2026\nNorth \t 120',
+      tableCells: MERGED_CELLS,
+      tableSpans: MERGED_SPANS,
+    })
+    expect(chapter).not.toContain('colspan')
+    expect(chapter).toContain('<tr><td>Region</td><td>First half 2026</td></tr>')
+  })
+
+  it('carries the block classes onto the table so a source table stays grey', async () => {
+    const chapter = await tableChapter()
+    expect(chapter).toContain('<table class="block"')
+    expect(chapter).not.toContain('<p class="block">Name')
+  })
+
+  it('rules the cells from the chapter stylesheet', async () => {
+    const zip = await JSZip.loadAsync(await buildEpub(fixtureDoc(), epubOptions()))
+    expect(await zipText(zip, 'OEBPS/css/main.css')).toContain('table.block td {')
+  })
+
+  it('falls back to a paragraph when the printed text has no cells left', async () => {
+    const chapter = await tableChapter({ translatedText: 'The figures were summarised.' })
+    expect(chapter).not.toContain('<table')
+    expect(chapter).toContain('The figures were summarised.')
+  })
+})
+
+describe('buildEpub figures', () => {
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  const ART = [{ key: 'cap#0', bytes: PNG, dataUrl: 'data:image/png;base64,iVBORw0KG==' }]
+
+  function figureDoc(figure: Partial<ExportBlock>): ExportDocument {
+    return {
+      ...fixtureDoc(),
+      pages: [
+        page(0, [block({ id: 'cap', y: 200, sourceText: '', translatedText: '', ...figure })]),
+      ],
+    }
+  }
+
+  async function figureChapter(figure: Partial<ExportBlock>, figures = ART): Promise<string> {
+    const zip = await JSZip.loadAsync(await buildEpub(figureDoc(figure), epubOptions({ figures })))
+    return zipText(zip, 'OEBPS/text/chap_1.xhtml')
+  }
+
+  it('files the picture under OEBPS/images and declares it in the manifest', async () => {
+    const zip = await JSZip.loadAsync(
+      await buildEpub(
+        figureDoc({
+          sourceText: 'Figure 1 — Stages',
+          figures: [ref({ x: 100, y: 40, w: 300, h: 140 })],
+        }),
+        epubOptions({ figures: ART }),
+      ),
+    )
+    const opf = await zipText(zip, 'OEBPS/content.opf')
+    expect(opf).toContain('<item id="figure-1" href="images/figure-1.png" media-type="image/png"/>')
+    expect(await zip.file('OEBPS/images/figure-1.png')?.async('uint8array')).toEqual(PNG)
+  })
+
+  it('puts a picture painted above its caption before the caption', async () => {
+    const chapter = await figureChapter({
+      sourceText: 'Figure 1 — Stages',
+      figures: [ref({ x: 100, y: 40, w: 300, h: 140 })],
+    })
+    expect(chapter.indexOf('<figure class="figure">')).toBeLessThan(chapter.indexOf('Figure 1'))
+  })
+
+  it('puts a picture painted below its block after it', async () => {
+    const chapter = await figureChapter({
+      sourceText: 'The pipeline runs in four stages.',
+      figures: [ref({ x: 100, y: 400, w: 300, h: 140 })],
+    })
+    expect(chapter.indexOf('<figure class="figure">')).toBeGreaterThan(
+      chapter.indexOf('The pipeline runs'),
+    )
+  })
+
+  it('reuses the caption as alt text and gives a prose figure none', async () => {
+    const captioned = await figureChapter({
+      sourceText: 'Figure 2 — Deployment',
+      figures: [ref({ x: 100, y: 40, w: 300, h: 140 })],
+    })
+    expect(captioned).toContain('alt="Figure 2 — Deployment"')
+
+    const unlabelled = await figureChapter({
+      sourceText: 'The pipeline runs in four stages.',
+      figures: [ref({ x: 100, y: 40, w: 300, h: 140 })],
+    })
+    expect(unlabelled).toContain('alt=""')
+  })
+
+  it('sizes the picture in points and caps it at the column', async () => {
+    const wide = await figureChapter({
+      sourceText: 'Figure 3 — Wide',
+      figures: [ref({ x: 20, y: 40, w: 700, h: 350 })],
+    })
+    expect(wide).toContain('width: 480pt; max-width: 100%; height: auto')
+
+    const narrow = await figureChapter({
+      sourceText: 'Figure 4 — Narrow',
+      figures: [ref({ x: 100, y: 40, w: 240, h: 120 })],
+    })
+    expect(narrow).toContain('width: 240pt')
+  })
+
+  it('skips a figure whose crop never came back instead of linking a missing file', async () => {
+    const chapter = await figureChapter(
+      { sourceText: 'Figure 5 — Lost', figures: [ref({ x: 100, y: 40, w: 300, h: 140 })] },
+      [],
+    )
+    expect(chapter).not.toContain('<img')
+    expect(chapter).toContain('Figure 5 — Lost')
+  })
+
+  it('still parses as XML with a figure in it', async () => {
+    const chapter = await figureChapter({
+      sourceText: 'Figure 6 — <b>escaped</b>',
+      figures: [ref({ x: 100, y: 40, w: 300, h: 140 })],
+    })
+    expectWellFormed(chapter, 'chap_1.xhtml')
+  })
+
+  it('leaves a document with no figures untouched', async () => {
+    const doc = figureDoc({ sourceText: 'Plain paragraph' })
+    const withArt = await zipText(
+      await JSZip.loadAsync(await buildEpub(doc, epubOptions({ figures: ART }))),
+      'OEBPS/text/chap_1.xhtml',
+    )
+    const plain = await zipText(
+      await JSZip.loadAsync(await buildEpub(doc, epubOptions())),
+      'OEBPS/text/chap_1.xhtml',
+    )
+    expect(withArt).toBe(plain)
+    expect(withArt).not.toContain('<img')
+  })
+
+  it('declares nothing in the manifest for art no chapter references', async () => {
+    const zip = await JSZip.loadAsync(
+      await buildEpub(figureDoc({ sourceText: 'Plain paragraph' }), epubOptions({ figures: ART })),
+    )
+    const opf = await zipText(zip, 'OEBPS/content.opf')
+    expect(opf).not.toContain('figure-1')
+    expect(zip.file('OEBPS/images/figure-1.png')).toBeNull()
+  })
+})

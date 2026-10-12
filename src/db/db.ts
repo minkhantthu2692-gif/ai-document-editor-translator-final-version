@@ -1,0 +1,418 @@
+/**
+ * Dexie (IndexedDB) schema.
+ *
+ * Version 1 — initial tables.
+ * Version 2 — adds `projects.archivedAt` and `blocks.kind` indexes and backfills
+ *             the sync metadata (deviceId / version / updatedAt) on legacy rows.
+ * Version 3 — adds `sourceFiles` (the original PDF bytes) and backfills the
+ *             Phase 2 analysis fields on existing pages/blocks.
+ * Version 4 — Phase 3: key-pool fields on `apiKeys` (enabled / cooldown /
+ *             usage counters / token buckets) and per-block translation
+ *             quality fields (confidence / flag / translatedAt).
+ * Version 5 — Phase 4: `revisions` (per-block history that powers undo/redo
+ *             and the inspector timeline) and the pending AI suggestion fields
+ *             on `blocks`.
+ * Version 6 — Phase 4: `originalFontSize` / `originalFontFamily` backfill.
+ * Version 7 — Phase 5: `syncConflicts` (LWW conflict log) and `syncMeta`
+ *             (single row: pull cursor, push cursors, device version vector).
+ *
+ * Dexie runs upgrade hooks only when an existing database is older than the
+ * version being installed, so a fresh install applies both schemas in order and
+ * skips the backfill.
+ */
+
+import Dexie, { type Table } from 'dexie'
+import { destroyDeviceSecret } from '@/core/crypto'
+import { getDeviceId, resetDeviceIdCache } from '@/core/id'
+import type {
+  ApiKeyRecord,
+  BlockRecord,
+  CacheRecord,
+  EventRecord,
+  GlossaryRecord,
+  JobRecord,
+  OutboxRecord,
+  PageRecord,
+  ProjectRecord,
+  RevisionRecord,
+  SettingRecord,
+  SourceFileRecord,
+  SyncConflictRecord,
+  SyncMetaRecord,
+  TranslationMemoryRecord,
+  TranslationRecord,
+  UsageStatsRecord,
+} from './types'
+
+export const DB_NAME = 'aidt'
+export const DB_SCHEMA_VERSION = 7
+
+/**
+ * Tables included in backup export/import. `syncConflicts` / `syncMeta` are
+ * deliberately device-local bookkeeping (pull cursors, per-device vectors) and
+ * must not travel between devices — restoring stale cursors would make a fresh
+ * device skip cloud changes it never saw.
+ */
+export const TABLE_NAMES = [
+  'projects',
+  'pages',
+  'blocks',
+  'translations',
+  'glossary',
+  'translationMemory',
+  'cache',
+  'jobs',
+  'events',
+  'outbox',
+  'settings',
+  'apiKeys',
+  'usageStats',
+  'sourceFiles',
+  'revisions',
+] as const
+
+/** Tables that existed at schema v2 — the v2 backfill must only touch these. */
+const V2_TABLE_NAMES: TableName[] = [
+  'projects',
+  'pages',
+  'blocks',
+  'translations',
+  'glossary',
+  'translationMemory',
+  'cache',
+  'jobs',
+  'events',
+  'outbox',
+  'settings',
+  'apiKeys',
+  'usageStats',
+]
+
+export type TableName = (typeof TABLE_NAMES)[number]
+
+export class AppDatabase extends Dexie {
+  projects!: Table<ProjectRecord, string>
+  pages!: Table<PageRecord, string>
+  blocks!: Table<BlockRecord, string>
+  translations!: Table<TranslationRecord, string>
+  glossary!: Table<GlossaryRecord, string>
+  translationMemory!: Table<TranslationMemoryRecord, string>
+  cache!: Table<CacheRecord, string>
+  jobs!: Table<JobRecord, string>
+  events!: Table<EventRecord, string>
+  outbox!: Table<OutboxRecord, string>
+  settings!: Table<SettingRecord, string>
+  apiKeys!: Table<ApiKeyRecord, string>
+  usageStats!: Table<UsageStatsRecord, string>
+  sourceFiles!: Table<SourceFileRecord, string>
+  revisions!: Table<RevisionRecord, string>
+  syncConflicts!: Table<SyncConflictRecord, string>
+  syncMeta!: Table<SyncMetaRecord, string>
+
+  constructor(name = DB_NAME) {
+    super(name)
+
+    this.version(1).stores({
+      projects: 'id, name, status, lastOpenedAt, createdAt, updatedAt',
+      pages: 'id, [projectId+index], projectId, ocrStatus, updatedAt',
+      blocks: 'id, [projectId+pageId+order], projectId, pageId, status, updatedAt',
+      translations:
+        'id, sourceHash, [projectId+blockId], projectId, blockId, provider, status, updatedAt',
+      glossary: 'id, sourceTerm, targetTerm, projectId, updatedAt',
+      translationMemory: 'id, sourceHash, [sourceLang+targetLang+sourceHash], hits, updatedAt',
+      cache: 'id, [kind+key], kind, expiresAt, lastAccessAt, updatedAt',
+      jobs: 'id, state, type, projectId, startedAt, updatedAt',
+      events: 'id, timestamp, severity, reasonCode, state, updatedAt',
+      outbox: 'id, [entity+entityId], nextAttemptAt, updatedAt',
+      settings: 'id, group, updatedAt',
+      apiKeys: 'id, provider, status, updatedAt',
+      usageStats: 'id, [provider+model+day], day, provider, updatedAt',
+    })
+
+    this.version(2)
+      .stores({
+        projects: 'id, name, status, lastOpenedAt, archivedAt, createdAt, updatedAt',
+        pages: 'id, [projectId+index], projectId, ocrStatus, updatedAt',
+        blocks: 'id, [projectId+pageId+order], projectId, pageId, kind, status, updatedAt',
+        translations:
+          'id, sourceHash, [projectId+blockId], projectId, blockId, provider, status, updatedAt',
+        glossary: 'id, sourceTerm, targetTerm, projectId, updatedAt',
+        translationMemory: 'id, sourceHash, [sourceLang+targetLang+sourceHash], hits, updatedAt',
+        cache: 'id, [kind+key], kind, expiresAt, lastAccessAt, updatedAt',
+        jobs: 'id, state, type, projectId, startedAt, updatedAt',
+        events: 'id, timestamp, severity, reasonCode, state, updatedAt',
+        outbox: 'id, [entity+entityId], nextAttemptAt, updatedAt',
+        settings: 'id, group, updatedAt',
+        apiKeys: 'id, provider, status, updatedAt',
+        usageStats: 'id, [provider+model+day], day, provider, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const deviceId = getDeviceId()
+        const now = Date.now()
+        // Only tables that existed at v2 — `sourceFiles` arrives with v3.
+        const tables: TableName[] = [...V2_TABLE_NAMES]
+        for (const tableName of tables) {
+          const table = tx.table(tableName)
+          await table.toCollection().modify((record: Record<string, unknown>) => {
+            if (!record.updatedAt) record.updatedAt = now
+            if (!record.createdAt) record.createdAt = record.updatedAt
+            if (!record.deviceId) record.deviceId = deviceId
+            if (typeof record.version !== 'number') record.version = 1
+          })
+        }
+        await tx
+          .table('projects')
+          .toCollection()
+          .modify((project: Record<string, unknown>) => {
+            if (typeof project.archived === 'boolean') {
+              project.archivedAt = project.archived ? (project.updatedAt as number) : null
+            } else {
+              project.archived = false
+              project.archivedAt = null
+            }
+          })
+      })
+
+    this.version(3)
+      .stores({
+        projects: 'id, name, status, lastOpenedAt, archivedAt, createdAt, updatedAt',
+        pages: 'id, [projectId+index], projectId, ocrStatus, contentClass, updatedAt',
+        blocks: 'id, [projectId+pageId+order], projectId, pageId, kind, status, region, updatedAt',
+        translations:
+          'id, sourceHash, [projectId+blockId], projectId, blockId, provider, status, updatedAt',
+        glossary: 'id, sourceTerm, targetTerm, projectId, updatedAt',
+        translationMemory: 'id, sourceHash, [sourceLang+targetLang+sourceHash], hits, updatedAt',
+        cache: 'id, [kind+key], kind, expiresAt, lastAccessAt, updatedAt',
+        jobs: 'id, state, type, projectId, startedAt, updatedAt',
+        events: 'id, timestamp, severity, reasonCode, state, updatedAt',
+        outbox: 'id, [entity+entityId], nextAttemptAt, updatedAt',
+        settings: 'id, group, updatedAt',
+        apiKeys: 'id, provider, status, updatedAt',
+        usageStats: 'id, [provider+model+day], day, provider, updatedAt',
+        sourceFiles: 'id, projectId, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // Backfill the Phase 2 analysis fields on rows written before v3.
+        const now = Date.now()
+        await tx
+          .table('pages')
+          .toCollection()
+          .modify((page: Record<string, unknown>) => {
+            if (page.contentClass === undefined) {
+              page.contentClass = page.hasTextLayer === false ? 'scanned' : 'text'
+            }
+            if (typeof page.textCoverage !== 'number') {
+              page.textCoverage = page.hasTextLayer === false ? 0 : 1
+            }
+            if (page.detectedLanguage === undefined) page.detectedLanguage = null
+            if (typeof page.lineCount !== 'number') page.lineCount = 0
+            if (page.analysisState === undefined) page.analysisState = 'idle'
+            if (page.ocrConfidence === undefined) page.ocrConfidence = null
+            if (typeof page.updatedAt !== 'number') page.updatedAt = now
+          })
+        await tx
+          .table('blocks')
+          .toCollection()
+          .modify((block: Record<string, unknown>) => {
+            if (block.region === undefined) block.region = 'body'
+            if (block.alignment === undefined) block.alignment = 'left'
+            if (!Array.isArray(block.lines)) block.lines = []
+            if (block.skipRule === undefined) block.skipRule = null
+            if (!Array.isArray(block.placeholders)) block.placeholders = []
+            if (block.listMarker === undefined) block.listMarker = null
+            if (typeof block.updatedAt !== 'number') block.updatedAt = now
+          })
+      })
+
+    this.version(4)
+      .stores({
+        projects: 'id, name, status, lastOpenedAt, archivedAt, createdAt, updatedAt',
+        pages: 'id, [projectId+index], projectId, ocrStatus, contentClass, updatedAt',
+        blocks: 'id, [projectId+pageId+order], projectId, pageId, kind, status, region, updatedAt',
+        translations:
+          'id, sourceHash, [projectId+blockId], projectId, blockId, provider, status, updatedAt',
+        glossary: 'id, sourceTerm, targetTerm, projectId, updatedAt',
+        translationMemory: 'id, sourceHash, [sourceLang+targetLang+sourceHash], hits, updatedAt',
+        cache: 'id, [kind+key], kind, expiresAt, lastAccessAt, updatedAt',
+        jobs: 'id, state, type, projectId, startedAt, updatedAt',
+        events: 'id, timestamp, severity, reasonCode, state, updatedAt',
+        outbox: 'id, [entity+entityId], nextAttemptAt, updatedAt',
+        settings: 'id, group, updatedAt',
+        apiKeys: 'id, provider, status, updatedAt',
+        usageStats: 'id, [provider+model+day], day, provider, updatedAt',
+        sourceFiles: 'id, projectId, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // Backfill the Phase 3 key-pool and translation-quality fields.
+        await tx
+          .table('apiKeys')
+          .toCollection()
+          .modify((key: Record<string, unknown>) => {
+            if (typeof key.enabled !== 'boolean') key.enabled = true
+            if (typeof key.cooldownUntil !== 'number') key.cooldownUntil = 0
+            if (key.cooldownReason === undefined) key.cooldownReason = null
+            if (typeof key.requests !== 'number') key.requests = 0
+            if (typeof key.tokensIn !== 'number') key.tokensIn = 0
+            if (typeof key.tokensOut !== 'number') key.tokensOut = 0
+            if (key.lastUsedAt === undefined) key.lastUsedAt = null
+            if (key.buckets === undefined) key.buckets = null
+          })
+        await tx
+          .table('blocks')
+          .toCollection()
+          .modify((block: Record<string, unknown>) => {
+            if (block.translationConfidence === undefined) block.translationConfidence = null
+            if (block.translationFlag === undefined) block.translationFlag = null
+            if (block.translatedAt === undefined) block.translatedAt = null
+          })
+      })
+
+    this.version(5)
+      .stores({
+        projects: 'id, name, status, lastOpenedAt, archivedAt, createdAt, updatedAt',
+        pages: 'id, [projectId+index], projectId, ocrStatus, contentClass, updatedAt',
+        blocks: 'id, [projectId+pageId+order], projectId, pageId, kind, status, region, updatedAt',
+        translations:
+          'id, sourceHash, [projectId+blockId], projectId, blockId, provider, status, updatedAt',
+        glossary: 'id, sourceTerm, targetTerm, projectId, updatedAt',
+        translationMemory: 'id, sourceHash, [sourceLang+targetLang+sourceHash], hits, updatedAt',
+        cache: 'id, [kind+key], kind, expiresAt, lastAccessAt, updatedAt',
+        jobs: 'id, state, type, projectId, startedAt, updatedAt',
+        events: 'id, timestamp, severity, reasonCode, state, updatedAt',
+        outbox: 'id, [entity+entityId], nextAttemptAt, updatedAt',
+        settings: 'id, group, updatedAt',
+        apiKeys: 'id, provider, status, updatedAt',
+        usageStats: 'id, [provider+model+day], day, provider, updatedAt',
+        sourceFiles: 'id, projectId, updatedAt',
+        revisions: 'id, [projectId+blockId], projectId, blockId, timestamp, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // Backfill the Phase 4 fields on rows written before v5.
+        await tx
+          .table('blocks')
+          .toCollection()
+          .modify((block: Record<string, unknown>) => {
+            if (block.suggestedText === undefined) block.suggestedText = null
+            if (block.suggestedModel === undefined) block.suggestedModel = null
+            if (block.suggestedAt === undefined) block.suggestedAt = null
+            if (block.fontSizeMode === undefined) block.fontSizeMode = 'original'
+            if (block.overflow === undefined) block.overflow = false
+          })
+      })
+
+    this.version(6)
+      .stores({
+        projects: 'id, name, status, lastOpenedAt, archivedAt, createdAt, updatedAt',
+        pages: 'id, [projectId+index], projectId, ocrStatus, contentClass, updatedAt',
+        blocks: 'id, [projectId+pageId+order], projectId, pageId, kind, status, region, updatedAt',
+        translations:
+          'id, sourceHash, [projectId+blockId], projectId, blockId, provider, status, updatedAt',
+        glossary: 'id, sourceTerm, targetTerm, projectId, updatedAt',
+        translationMemory: 'id, sourceHash, [sourceLang+targetLang+sourceHash], hits, updatedAt',
+        cache: 'id, [kind+key], kind, expiresAt, lastAccessAt, updatedAt',
+        jobs: 'id, state, type, projectId, startedAt, updatedAt',
+        events: 'id, timestamp, severity, reasonCode, state, updatedAt',
+        outbox: 'id, [entity+entityId], nextAttemptAt, updatedAt',
+        settings: 'id, group, updatedAt',
+        apiKeys: 'id, provider, status, updatedAt',
+        usageStats: 'id, [provider+model+day], day, provider, updatedAt',
+        sourceFiles: 'id, projectId, updatedAt',
+        revisions: 'id, [projectId+blockId], projectId, blockId, timestamp, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // The extracted size is what "Font size → Original" restores, so it has
+        // to survive the first manual/auto-fit override of `fontSize`.
+        await tx
+          .table('blocks')
+          .toCollection()
+          .modify((block: Record<string, unknown>) => {
+            if (typeof block.originalFontSize !== 'number') {
+              block.originalFontSize = typeof block.fontSize === 'number' ? block.fontSize : 12
+            }
+            if (typeof block.originalFontFamily !== 'string') {
+              block.originalFontFamily =
+                typeof block.fontFamily === 'string' ? block.fontFamily : 'Noto Sans'
+            }
+          })
+      })
+
+    this.version(7).stores({
+      projects: 'id, name, status, lastOpenedAt, archivedAt, createdAt, updatedAt',
+      pages: 'id, [projectId+index], projectId, ocrStatus, contentClass, updatedAt',
+      blocks: 'id, [projectId+pageId+order], projectId, pageId, kind, status, region, updatedAt',
+      translations:
+        'id, sourceHash, [projectId+blockId], projectId, blockId, provider, status, updatedAt',
+      glossary: 'id, sourceTerm, targetTerm, projectId, updatedAt',
+      translationMemory: 'id, sourceHash, [sourceLang+targetLang+sourceHash], hits, updatedAt',
+      cache: 'id, [kind+key], kind, expiresAt, lastAccessAt, updatedAt',
+      jobs: 'id, state, type, projectId, startedAt, updatedAt',
+      events: 'id, timestamp, severity, reasonCode, state, updatedAt',
+      outbox: 'id, [entity+entityId], nextAttemptAt, updatedAt',
+      settings: 'id, group, updatedAt',
+      apiKeys: 'id, provider, status, updatedAt',
+      usageStats: 'id, [provider+model+day], day, provider, updatedAt',
+      sourceFiles: 'id, projectId, updatedAt',
+      revisions: 'id, [projectId+blockId], projectId, blockId, timestamp, updatedAt',
+      // Phase 5 — cloud sync bookkeeping (see src/sync/).
+      syncConflicts: 'id, entity, entityId, detectedAt, updatedAt',
+      syncMeta: 'id',
+    })
+  }
+}
+
+let database: AppDatabase | null = null
+
+export function getDb(): AppDatabase {
+  if (!database) database = new AppDatabase()
+  return database
+}
+
+/** Test seam: inject a pre-built instance (fake-indexeddb in unit tests). */
+export function setDb(instance: AppDatabase | null): void {
+  database = instance
+}
+
+export async function closeDb(): Promise<void> {
+  if (database) {
+    database.close()
+    database = null
+  }
+}
+
+/** Deletes the whole database (Settings → Delete all local data). */
+export async function deleteDatabase(): Promise<void> {
+  await closeDb()
+  await new Promise<void>((resolve, reject) => {
+    const request = indexedDB.deleteDatabase(DB_NAME)
+    request.onsuccess = () => resolve()
+    request.onerror = () => reject(request.error ?? new Error('deleteDatabase failed'))
+    request.onblocked = () => resolve()
+  })
+  database = null
+}
+
+/** The one localStorage key Dexie itself never owns (see `src/stores/uiStore.ts`). */
+const UI_STORE_KEY = 'aidt.ui'
+/** Cached browser-profile id (see `src/core/id.ts` — its own reset is memory-only). */
+const DEVICE_ID_KEY = 'aidt.deviceId'
+
+/**
+ * Factory reset — the whole app back to its freshly-installed state
+ * (Settings → Cache → "Reset the whole app"). Erases every database table
+ * (projects, pages, blocks, translations, translation memory, glossary, API
+ * keys, settings, usage, events, sync state), the sealed device secret, the
+ * cached device id and the persisted UI preferences (theme, language, view).
+ * The caller reloads the page afterwards; every default re-seeds on boot, so
+ * the next visit starts at the welcome screen exactly like a new install.
+ */
+export async function resetEverything(): Promise<void> {
+  destroyDeviceSecret()
+  resetDeviceIdCache()
+  await deleteDatabase()
+  try {
+    globalThis.localStorage?.removeItem(DEVICE_ID_KEY)
+    globalThis.localStorage?.removeItem(UI_STORE_KEY)
+  } catch {
+    /* storage disabled (private mode) — nothing persisted to clear */
+  }
+}
