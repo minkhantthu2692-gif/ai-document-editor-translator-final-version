@@ -19,9 +19,10 @@
 import { blockRepo } from '@/db/repo-content'
 import { checkFonts, collectFontFaces, suggestFallback, type FontFaceInfo } from '@/fonts'
 import { downloadBlob } from '@/lib/download'
+import type { BBox } from '@/pdf/stableId'
 import { ExportBuildError, buildInWorker, stageProgress } from './client'
 import { collectExportDocument, usedFamilies } from './collect'
-import { renderPageImages, needsImages, type RenderedImage } from './pageImages'
+import { renderPageImages, needsImages, pageEraseBoxes, type RenderedImage } from './pageImages'
 import { renderFigureCrops } from './figureCrops'
 import { figureTargets, loadFigureArt } from './figureArt'
 import type { FigureArt } from './figureArt'
@@ -197,11 +198,20 @@ export async function runExport(input: RunExportInput): Promise<ExportResult> {
   let images: RenderedImage[] = []
   if (imageRequirement(options.format, options.includeImages)) {
     report('render', 0, doc.pages.length)
+    // Scanned/OCR pages need their stored block boxes erased from the
+    // background — the text layer there is empty (C-02). Computed once from
+    // the collected document; pages without geometry simply send nothing.
+    const eraseBoxesByPage = new Map<number, BBox[]>()
+    for (const page of doc.pages) {
+      const boxes = pageEraseBoxes(page)
+      if (boxes.length > 0) eraseBoxesByPage.set(page.index, boxes)
+    }
     images = await renderPageImages({
       projectId: input.projectId,
       pageIndexes: doc.pages.map((page) => page.index),
       scale: options.imageScale,
       mode: 'background',
+      eraseBoxesFor: (pageIndex) => eraseBoxesByPage.get(pageIndex),
       ...(input.signal ? { signal: input.signal } : {}),
       onProgress: (done, total) => report('render', done, total),
     })

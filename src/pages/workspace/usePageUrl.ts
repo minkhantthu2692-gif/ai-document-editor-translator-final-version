@@ -10,9 +10,10 @@
  * 300-page document must not queue 300 renders.
  */
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { analysisClient } from '@/pdf/analysisClient'
 import { ensureProjectDocument } from '@/pdf/projectAnalysis'
+import { eraseSignature, type BBox } from '@/pdf/pageRender'
 import { getCachedUrl, putCachedUrl, renderCacheKey } from '@/pdf/renderCache'
 
 /**
@@ -54,8 +55,18 @@ export function usePageUrl(
   fileId: string | null,
   pageIndex: number,
   mode: PageImageMode,
+  /** Stored boxes to erase from a `background` render (scanned/OCR pages). */
+  eraseBoxes?: readonly BBox[],
 ): string | null {
-  const key = fileId ? renderCacheKey(fileId, pageIndex, mode, PAGE_IMAGE_SCALE) : null
+  // Only the *set* of boxes changes what the picture looks like, so the
+  // signature — not the array identity — is what the cache and effect key on:
+  // a translation edit must not re-render the artwork underneath it.
+  const erase = mode === 'background' ? eraseSignature(eraseBoxes) : ''
+  const key = fileId
+    ? renderCacheKey(fileId, pageIndex, mode, PAGE_IMAGE_SCALE, erase)
+    : null
+  const boxesRef = useRef(eraseBoxes)
+  boxesRef.current = eraseBoxes
   const [url, setUrl] = useState<string | null>(null)
 
   useEffect(() => {
@@ -71,8 +82,11 @@ export function usePageUrl(
 
     let settled = false
     let alive = true
+    const boxes = mode === 'background' ? boxesRef.current : undefined
     analysisClient
-      .render(fileId, pageIndex, PAGE_IMAGE_SCALE, mode)
+      .render(fileId, pageIndex, PAGE_IMAGE_SCALE, mode, {
+        ...(boxes && boxes.length > 0 ? { eraseBoxes: boxes } : {}),
+      })
       .then((blob) => {
         settled = true
         const next = putCachedUrl(key, blob)
@@ -84,9 +98,9 @@ export function usePageUrl(
 
     return () => {
       alive = false
-      if (!settled) analysisClient.cancelRender(fileId, pageIndex, PAGE_IMAGE_SCALE, mode)
+      if (!settled) analysisClient.cancelRender(fileId, pageIndex, PAGE_IMAGE_SCALE, mode, erase)
     }
-  }, [fileId, key, pageIndex, mode])
+  }, [fileId, key, pageIndex, mode, erase])
 
   return url
 }

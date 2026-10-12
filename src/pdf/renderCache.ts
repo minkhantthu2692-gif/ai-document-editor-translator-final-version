@@ -29,8 +29,10 @@ export function renderCacheKey(
   pageIndex: number,
   mode: 'thumbnail' | 'background',
   scale: number,
+  /** `eraseSignature` of stored erase boxes — see `planErase`. */
+  erase: string = '',
 ): string {
-  return `${fileId}#${pageIndex}#${mode}#${scale.toFixed(3)}`
+  return `${fileId}#${pageIndex}#${mode}#${scale.toFixed(3)}${erase ? `#${erase}` : ''}`
 }
 
 /** Returns a live URL for `key`, promoting it to the front of the LRU. */

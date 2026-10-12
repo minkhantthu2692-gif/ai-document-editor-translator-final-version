@@ -43,11 +43,13 @@ import {
 } from '@/pdf/pdfExtract'
 import type { TableContinuation } from '@/pdf/rowSplit'
 import {
+  eraseSignature,
   isRenderCancelled,
   renderPage,
   type FigureCropTarget,
   type RenderHandle,
 } from '@/pdf/pageRender'
+import type { BBox } from '@/pdf/stableId'
 import { traceImagePlacements, type ImagePlacement } from '@/pdf/imageOps'
 import type { OpList } from '@/pdf/pdfOps'
 import { repairPdf } from '@/pdf/repair'
@@ -101,6 +103,8 @@ interface RenderEntry {
   handle: RenderHandle | null
   /** Figure cut-outs requested with this render; empty for an ordinary one. */
   crops: FigureCropTarget[]
+  /** Stored block boxes to mask alongside the text layer; often empty. */
+  eraseBoxes: BBox[]
 }
 
 const renderQueue: RenderEntry[] = []
@@ -108,9 +112,10 @@ const renderByKey = new Map<string, RenderEntry>()
 let rendering = false
 
 /**
- * Supersede only an identical render — scale, mode and "is this a figure
- * render" together identify the consumer, so a thumbnail and a figure crop of
- * the same page never cancel each other.
+ * Supersede only an identical render — scale, mode, "is this a figure
+ * render" and the erase signature together identify the consumer, so a
+ * thumbnail, a figure crop and an OCR-erase background of the same page never
+ * cancel each other.
  */
 const renderKey = (
   fileId: string,
@@ -118,7 +123,13 @@ const renderKey = (
   scale: number,
   mode: string,
   crops: readonly FigureCropTarget[] = [],
-): string => `${fileId}#${pageIndex}#${scale}#${mode}#${crops.length > 0 ? 'figures' : 'page'}`
+  eraseBoxes?: readonly BBox[],
+): string => {
+  const erase = eraseSignature(eraseBoxes)
+  return `${fileId}#${pageIndex}#${scale}#${mode}#${crops.length > 0 ? 'figures' : 'page'}${
+    erase ? `#${erase}` : ''
+  }`
+}
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -504,7 +515,8 @@ async function handleExtract(request: ExtractRequest): Promise<void> {
 
 function handleRender(request: RenderRequest): void {
   const crops = request.crops ?? []
-  const key = renderKey(request.fileId, request.pageIndex, request.scale, request.mode, crops)
+  const eraseBoxes = request.eraseBoxes ?? []
+  const key = renderKey(request.fileId, request.pageIndex, request.scale, request.mode, crops, eraseBoxes)
   const stale = renderByKey.get(key)
   if (stale) {
     // A newer request for the same page supersedes the older one.
@@ -520,6 +532,7 @@ function handleRender(request: RenderRequest): void {
     cancelled: false,
     handle: null,
     crops,
+    eraseBoxes,
   }
   renderByKey.set(key, entry)
   renderQueue.push(entry)
@@ -545,7 +558,7 @@ async function drainRenders(): Promise<void> {
 }
 
 async function runRender(entry: RenderEntry): Promise<void> {
-  const key = renderKey(entry.fileId, entry.pageIndex, entry.scale, entry.mode, entry.crops)
+  const key = renderKey(entry.fileId, entry.pageIndex, entry.scale, entry.mode, entry.crops, entry.eraseBoxes)
   const open = requireDoc(entry.fileId)
   if (!open) {
     renderByKey.delete(key)
@@ -565,6 +578,9 @@ async function runRender(entry: RenderEntry): Promise<void> {
       scale: entry.scale,
       maskText: entry.mode === 'background',
       ...(entry.crops.length > 0 ? { crops: entry.crops } : {}),
+      ...(entry.eraseBoxes.length > 0 && entry.mode === 'background'
+        ? { eraseBoxes: entry.eraseBoxes }
+        : {}),
     })
     entry.handle = handle
     if (entry.cancelled) handle.cancel()

@@ -10,6 +10,8 @@
 
 import { analysisClient } from '@/pdf/analysisClient'
 import { ensureProjectDocument } from '@/pdf/projectAnalysis'
+import { storedEraseBoxes, type BBox } from '@/pdf/pageRender'
+import type { ExportPage } from './types'
 
 export interface RenderedImage {
   /** 0-based page index. */
@@ -25,6 +27,13 @@ export interface RenderImagesOptions {
   scale: number
   /** `background` erases the text layer, `thumbnail` keeps everything. */
   mode?: 'background' | 'thumbnail'
+  /**
+   * Stored block boxes (PDF points) to erase from the background of a page in
+   * addition to the text layer — the geometry scanned/OCR pages need, since
+   * their text is in the image and `getTextContent()` finds nothing (C-02).
+   * Ignored unless `mode` is `background`; see `planErase` for the policy.
+   */
+  eraseBoxesFor?: (pageIndex: number) => readonly BBox[] | undefined
   /** Parallel requests against the analysis worker. */
   concurrency?: number
   onProgress?: (done: number, total: number) => void
@@ -63,8 +72,11 @@ export async function renderPageImages(options: RenderImagesOptions): Promise<Re
       if (options.signal?.aborted) return
       const index = options.pageIndexes[position]
       try {
+        const eraseBoxes =
+          mode === 'background' ? options.eraseBoxesFor?.(index) : undefined
         const blob = await analysisClient.render(fileId, index, options.scale, mode, {
           ...(options.signal ? { signal: options.signal } : {}),
+          ...(eraseBoxes && eraseBoxes.length > 0 ? { eraseBoxes } : {}),
         })
         results[position] = { index, blob }
       } catch {
@@ -89,4 +101,14 @@ export function needsImages(format: string): boolean {
     format === 'pdf' ||
     format === 'bilingual-pdf'
   )
+}
+
+/**
+ * Stored erase geometry for one page's background, per `contentClass` — the
+ * export-facing wrapper around `storedEraseBoxes` (C-02 / L-01), which
+ * documents the policy itself.
+ */
+export function pageEraseBoxes(page: ExportPage | undefined): BBox[] {
+  if (!page) return []
+  return storedEraseBoxes(page.contentClass, page.blocks)
 }

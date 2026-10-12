@@ -13,6 +13,7 @@ import type { ReasonCode } from '@/core/reasonCodes'
 import type { ExtractedPage, ProbeResult } from '@/pdf/pdfExtract'
 import type { FigureCropTarget, PageCrop } from '@/pdf/pageRender'
 import type { SkipContext } from '@/pdf/skipRules'
+import type { BBox } from '@/pdf/stableId'
 
 export type AnalysisStage = 'open' | 'probe' | 'extract' | 'render'
 
@@ -62,6 +63,12 @@ export interface RenderRequest extends RequestBase {
    * shipping whole pages across the worker boundary.
    */
   crops?: FigureCropTarget[]
+  /**
+   * Stored block boxes (PDF points, top-left) to mask alongside the text
+   * layer when `mode === 'background'`. Sent for pages whose text is only in
+   * the image — see `RenderPageOptions.eraseBoxes`.
+   */
+  eraseBoxes?: BBox[]
 }
 
 export interface CloseRequest extends RequestBase {

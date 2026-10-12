@@ -13,8 +13,9 @@
 import AnalysisWorker from '@/workers/analysis.worker?worker'
 import type { ReasonCode } from '@/core/reasonCodes'
 import type { ExtractedPage, ProbeResult } from '@/pdf/pdfExtract'
-import type { FigureCropTarget, PageCrop } from '@/pdf/pageRender'
+import { eraseSignature, type FigureCropTarget, type PageCrop } from '@/pdf/pageRender'
 import type { SkipContext } from '@/pdf/skipRules'
+import type { BBox } from '@/pdf/stableId'
 import type { AnalysisEvent, AnalysisPayload, AnalysisRequest } from '@/workers/protocol'
 
 /** A request failed for a reason the Status Panel can explain. */
@@ -66,12 +67,19 @@ function unexpected(event: AnalysisEvent): Error {
 }
 
 /**
- * One render per `(file, page, scale, mode)`: two consumers rendering the
- * same page at different sizes (a thumbnail vs. the page image vs. an OCR
- * pass) must not supersede each other — only an identical repeat does.
+ * One render per `(file, page, scale, mode, erase)`: two consumers rendering
+ * the same page at different sizes (a thumbnail vs. the page image vs. an OCR
+ * pass) must not supersede each other — only an identical repeat does. The
+ * erase signature is part of the identity for the same reason: a background
+ * that masks stored block boxes is not the same picture as one that does not.
  */
-const renderKey = (fileId: string, pageIndex: number, scale: number, mode: string): string =>
-  `${fileId}#${pageIndex}#${scale}#${mode}`
+const renderKey = (
+  fileId: string,
+  pageIndex: number,
+  scale: number,
+  mode: string,
+  erase: string = '',
+): string => `${fileId}#${pageIndex}#${scale}#${mode}${erase ? `#${erase}` : ''}`
 
 class AnalysisClient {
   private worker: Worker | null = null
@@ -236,13 +244,26 @@ class AnalysisClient {
     pageIndex: number,
     scale: number,
     mode: 'thumbnail' | 'background',
-    options: { signal?: AbortSignal } = {},
+    options: { signal?: AbortSignal; eraseBoxes?: readonly BBox[] } = {},
   ): Promise<Blob> {
-    const key = renderKey(fileId, pageIndex, scale, mode)
+    const { signal, eraseBoxes } = options
+    const erase = eraseSignature(eraseBoxes)
+    const key = renderKey(fileId, pageIndex, scale, mode, erase)
     const id = this.nextId()
     this.renderInFlight.set(key, id)
     try {
-      const event = await this.send({ kind: 'render', fileId, pageIndex, scale, mode }, options, id)
+      const event = await this.send(
+        {
+          kind: 'render',
+          fileId,
+          pageIndex,
+          scale,
+          mode,
+          ...(eraseBoxes && eraseBoxes.length > 0 ? { eraseBoxes: [...eraseBoxes] } : {}),
+        },
+        { ...(signal ? { signal } : {}) },
+        id,
+      )
       if (event.kind === 'renderResult') {
         if (!event.blob) throw new Error(`page ${pageIndex} rendered without an image`)
         return event.blob
@@ -286,8 +307,8 @@ class AnalysisClient {
    * page scrolled out of the prefetch window). The worker reports it back as
    * `cancelled`, which settles the matching promise.
    */
-  cancelRender(fileId: string, pageIndex: number, scale: number, mode: string): void {
-    const id = this.renderInFlight.get(renderKey(fileId, pageIndex, scale, mode))
+  cancelRender(fileId: string, pageIndex: number, scale: number, mode: string, erase = ''): void {
+    const id = this.renderInFlight.get(renderKey(fileId, pageIndex, scale, mode, erase))
     if (!id || !this.worker) return
     this.worker.postMessage({ kind: 'cancel', id } satisfies AnalysisRequest)
   }

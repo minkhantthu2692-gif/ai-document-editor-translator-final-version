@@ -7,13 +7,20 @@
  * sample the colours on a thin ring just outside its box (median over the four
  * sides) and repaint the box with them. Images and vector graphics outside the
  * boxes are untouched, which is exactly what the translated text overlay needs.
+ * Pages whose text lives only in the image (scanned, OCR) have no runs at all,
+ * so the caller can hand in stored block boxes as erase geometry — `planErase`
+ * decides what is actually painted.
  *
  * Renders are cancellable — the workspace drops stale requests as the user
  * scrolls, and `renderPage` exposes the underlying pdf.js render task.
  */
 
 import type { PDFPageProxy, RenderTask } from 'pdfjs-dist'
+import type { PageContentClass } from '@/db/types'
 import type { BBox } from './stableId'
+
+/** The page-rectangle frame every helper here speaks: PDF points, top-left. */
+export type { BBox } from './stableId'
 
 export interface RenderPageOptions {
   /** Viewport scale (1 = 72 dpi). Thumbnails use ~0.15–0.25. */
@@ -31,6 +38,18 @@ export interface RenderPageOptions {
    * does not want the page.
    */
   crops?: readonly FigureCropTarget[]
+  /**
+   * Extra rectangles to mask away alongside the text layer (page space in PDF
+   * points, top-left origin — the same frame as a `BBox`).
+   *
+   * These are *stored block boxes*, and they exist for pages whose text lives
+   * only in the image: a scanned page has no `getTextContent()` runs at all,
+   * so without them the render keeps its original text and the translated
+   * overlay prints a second copy over it. Applied through `planErase`, which
+   * skips any box already covered by a text-layer run, so the padded box of a
+   * text block never widens the repaint over the art around it.
+   */
+  eraseBoxes?: readonly BBox[]
 }
 
 /** A rectangle of the page an export wants as its own picture. */
@@ -178,6 +197,113 @@ function median(values: number[]): number {
   return sorted[Math.floor(sorted.length / 2)]
 }
 
+/** A rectangle in viewport pixels, top-left origin. */
+interface MaskBox {
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+/** Fraction of the smaller box the two boxes share. */
+function overlapRatio(a: MaskBox, b: MaskBox): number {
+  const w = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)
+  const h = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y)
+  if (w <= 0 || h <= 0) return 0
+  const intersection = w * h
+  const smallest = Math.min(a.w * a.h, b.w * b.h)
+  return smallest > 0 ? intersection / smallest : 0
+}
+
+/**
+ * What gets painted away before the translation goes on top.
+ *
+ *  - Every text-layer run is masked: those boxes are exact glyph extents, so
+ *    erasing them cannot touch anything but text.
+ *  - The caller's stored boxes are *extra* geometry for text the text layer
+ *    cannot see. On a scanned page there are no runs at all, so all of them
+ *    are used — that is the whole point. On a hybrid page (text layer plus
+ *    OCR'd image regions) the text-derived blocks are skipped because their
+ *    runs already erased them, and only the genuinely image-only regions are
+ *    painted away.
+ *
+ * A skipped-or-empty result is safe, not a failure: a page with neither runs
+ * nor stored boxes simply renders unmasked.
+ */
+export function planErase(
+  textLayerBoxes: readonly MaskBox[],
+  storedBoxes: readonly BBox[] | undefined,
+  scale: number,
+): MaskBox[] {
+  const planned: MaskBox[] = [...textLayerBoxes]
+  if (!storedBoxes || storedBoxes.length === 0) return planned
+  for (const box of storedBoxes) {
+    const scaled: MaskBox = {
+      x: box.x * scale,
+      y: box.y * scale,
+      w: box.w * scale,
+      h: box.h * scale,
+    }
+    if (!(scaled.w > 0) || !(scaled.h > 0)) continue
+    if (textLayerBoxes.some((run) => overlapRatio(run, scaled) >= 0.5)) continue
+    planned.push(scaled)
+  }
+  return planned
+}
+
+/**
+ * A short stable signature of a set of erase boxes, so render dedupe keys can
+ * tell an erase request apart from an identical-looking one without it (the
+ * client supersede map and the worker's per-page render key both use it).
+ */
+export function eraseSignature(boxes: readonly BBox[] | undefined): string {
+  if (!boxes || boxes.length === 0) return ''
+  let sum = 0
+  for (const box of boxes) sum += box.x + box.y + box.w + box.h
+  return `${boxes.length}:${Math.round(sum)}`
+}
+
+/** The block fields erasure needs — `BlockRecord` and `ExportBlock` both fit. */
+export interface ErasableBlock {
+  x: number
+  y: number
+  width: number
+  height: number
+  sourceText: string
+  translatedText: string
+}
+
+/**
+ * Stored erase geometry for one page, per `contentClass`.
+ *
+ * Only pages whose text lives (partly) in the image qualify — `scanned` and
+ * `mixed`. Their blocks came from OCR, and a render with no text-layer runs
+ * masks nothing at all, so without this geometry the background keeps the
+ * original text and whatever sits on top prints a second copy of it (C-02).
+ * `text`/`complex`/`empty` pages get nothing: their runs are exact glyph
+ * extents, and a padded block box would widen the repaint over the art around
+ * it. `planErase` applies the same reasoning again render-side, so a box that
+ * slipped through here still cannot double-erase a run.
+ *
+ * A block with no text at all is skipped too — nothing paints over it, so its
+ * pixels must stay. Every other block is printed on export (its translation,
+ * or the source fallback in `textOf`), which is what makes masking its box
+ * safe: content is never erased without being shown again.
+ */
+export function storedEraseBoxes(
+  contentClass: PageContentClass,
+  blocks: readonly ErasableBlock[],
+): BBox[] {
+  if (contentClass !== 'scanned' && contentClass !== 'mixed') return []
+  const boxes: BBox[] = []
+  for (const block of blocks) {
+    if ((block.translatedText || block.sourceText).trim().length === 0) continue
+    if (!(block.width > 0) || !(block.height > 0)) continue
+    boxes.push({ x: block.x, y: block.y, w: block.width, h: block.height })
+  }
+  return boxes
+}
+
 /**
  * Repaints one box with the median colour of a ring 2 px outside it.
  * Falls back to white when the ring cannot be read (fully transparent edges).
@@ -257,7 +383,7 @@ export function renderPage(page: PDFPageProxy, options: RenderPageOptions): Rend
     await task.promise
 
     if (options.maskText && !cancelled) {
-      const boxes = await textBoxes(page, viewport)
+      const boxes = planErase(await textBoxes(page, viewport), options.eraseBoxes, scale)
       for (const box of boxes) {
         if (cancelled) break
         inpaintBox(context, box)

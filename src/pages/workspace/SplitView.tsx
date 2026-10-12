@@ -18,6 +18,7 @@ import type { PageRecord } from '@/db/types'
 import type { IndexedBlock } from '@/editor/commands'
 import { reflowForPage } from '@/editor/layout'
 import type { EditorView } from '@/editor/types'
+import { storedEraseBoxes, type BBox } from '@/pdf/pageRender'
 import { BlockLayer, type BlockHighlight } from './BlockLayer'
 import { usePageUrl, useProjectFileId } from './usePageUrl'
 
@@ -58,11 +59,13 @@ interface PaneProps {
   mode: 'thumbnail' | 'background'
   testId: string
   badge?: string
+  /** Stored boxes to erase from a `background` render (scanned/OCR pages). */
+  eraseBoxes?: readonly BBox[]
   children?: ReactNode
 }
 
-function Pane({ fileId, page, zoom, mode, testId, badge, children }: PaneProps) {
-  const url = usePageUrl(fileId, page.index, mode)
+function Pane({ fileId, page, zoom, mode, testId, badge, eraseBoxes, children }: PaneProps) {
+  const url = usePageUrl(fileId, page.index, mode, eraseBoxes)
   const widthPt = Math.max(1, page.width)
   const heightPt = Math.max(1, page.height)
 
@@ -107,6 +110,13 @@ function PageRow({ page, blocks, fileId, view, zoom, ...rest }: PageRowProps) {
   // a block whose translation outgrew its box moves the blocks below it down
   // here exactly as it will on the printed page.
   const laidOut = useMemo(() => reflowForPage(blocks, page.height), [blocks, page.height])
+  // Scanned/OCR pages: without this geometry the pane artwork keeps the
+  // original text and the overlay doubles it (C-02). Same fix, same policy as
+  // the export background — the pane shows what will print.
+  const eraseBoxes = useMemo(
+    () => storedEraseBoxes(page.contentClass, blocks),
+    [page.contentClass, blocks],
+  )
 
   return (
     <div
@@ -137,6 +147,7 @@ function PageRow({ page, blocks, fileId, view, zoom, ...rest }: PageRowProps) {
             mode="background"
             testId="pane-translated"
             badge={t('editor.translatedPane')}
+            eraseBoxes={eraseBoxes}
           >
             <div
               className="absolute inset-0"
