@@ -31,6 +31,13 @@ export interface CompositeOptions {
   adjustLayout?: boolean
   /** Called once per block the page edge stopped (only while reflowing). */
   onOverlap?: (blockId: string) => void
+  /**
+   * Called once per block whose extra lines were cut at the box edge — only
+   * while `adjustLayout` is off, which is the only mode where the paint
+   * clamps at all (the default sheet may not print past its own geometry,
+   * and silence about that was the bug — C-03).
+   */
+  onClipped?: (blockId: string) => void
   /** Called when no canvas was available to measure text with. */
   onEstimated?: () => void
 }
@@ -98,11 +105,45 @@ function drawBlock(
   const step = size * block.lineHeight * scale
   const x = anchorX()
 
+  // Source geometry — the default sheet — prints *inside* the box and nothing
+  // else: a line the 6pt floor could not bring back is cut here and reported
+  // through `onClipped`, rather than painted over whatever sits below (C-03).
+  // Auto-fit has already shrunk a fitting block until its own line bottoms
+  // land inside the box, so the clamp only ever fires on text that genuinely
+  // does not fit. With `adjustLayout` on there is no clamp: the reflow has
+  // made room for every line, and cutting here would delete exactly the text
+  // the push was for.
+  const clamp = options.adjustLayout !== true
+  const boxBottom = (block.y + block.height) * scale
+  let dropped = false
+
   lines.forEach((line, index) => {
     const value = index === 0 ? `${listPrefix(block, line)}${line}` : line
     if (value.length === 0) return
+    if (clamp && block.y * scale + (index + 1) * step > boxBottom + 1) {
+      dropped = true
+      return
+    }
     ctx.fillText(value, x, block.y * scale + index * step)
   })
+
+  // `!fitted.fits` covers what the line loop cannot see: a line wider than
+  // the box (an unbreakable token) paints past the right edge, and a height
+  // that only just exceeds the box can round into place.
+  if (clamp && (dropped || !fitted.fits)) options.onClipped?.(block.id)
+
+  // The same red flag the HTML export draws (`.block.overflow`, print mode
+  // included): the model already knows this block's text outgrew its source
+  // box, and the image export must say so too rather than look pristine.
+  // Painting the flag is what "honour `block.overflow`" means here — the
+  // *count* in `EXPORT_LAYOUT_CLIPPED` stays the worker's own measurement.
+  if (block.overflow) {
+    ctx.setLineDash([4 * scale, 3 * scale])
+    ctx.strokeStyle = '#dc2626'
+    ctx.lineWidth = Math.max(1, scale)
+    ctx.strokeRect(block.x * scale, block.y * scale, block.width * scale, block.height * scale)
+    ctx.setLineDash([])
+  }
 }
 
 /**

@@ -32,6 +32,8 @@ export interface RasterPdfOptions {
   adjustLayout?: boolean
   /** Called once per block the page edge stopped while reflowing. */
   onOverlap?: (blockId: string) => void
+  /** Called once per block whose extra lines were cut at the box edge. */
+  onClipped?: (blockId: string) => void
   /** Called once per page measured without a canvas. */
   onEstimated?: () => void
   /** Called after each page is embedded (progress). */
@@ -59,7 +61,7 @@ export function missingArtwork(doc: ExportDocument, backgrounds: RasterImage[]):
 
 export function rasterOptionsFrom(
   options: ExportOptions,
-): Omit<RasterPdfOptions, 'onPage' | 'onOverlap' | 'onEstimated'> {
+): Omit<RasterPdfOptions, 'onPage' | 'onOverlap' | 'onClipped' | 'onEstimated'> {
   return {
     scale: options.imageScale,
     fontStack: options.fontStack,
@@ -96,6 +98,7 @@ export async function buildRasterPdf(
       quality: options.quality ?? 0.92,
       adjustLayout: options.adjustLayout,
       onOverlap: options.onOverlap,
+      onClipped: options.onClipped,
       onEstimated: options.onEstimated,
     })
     const embedded = await pdf.embedJpg(await sheet.arrayBuffer())

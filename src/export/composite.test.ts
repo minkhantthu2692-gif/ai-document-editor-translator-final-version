@@ -190,7 +190,7 @@ describe('raster layout adjustment', () => {
  * no unit test can honestly claim.
  */
 interface PaintCall {
-  op: 'fillRect' | 'fillText' | 'drawImage'
+  op: 'fillRect' | 'fillText' | 'drawImage' | 'strokeRect'
   args: unknown[]
 }
 
@@ -199,6 +199,8 @@ let canvases: FakeCanvas[] = []
 
 class FakeContext {
   fillStyle = ''
+  strokeStyle = ''
+  lineWidth = 1
   font = ''
   direction: CanvasDirection = 'ltr'
   textAlign: CanvasTextAlign = 'left'
@@ -206,6 +208,14 @@ class FakeContext {
 
   fillRect(...args: number[]): void {
     painted.push({ op: 'fillRect', args })
+  }
+
+  strokeRect(...args: number[]): void {
+    painted.push({ op: 'strokeRect', args })
+  }
+
+  setLineDash(_segments: number[]): void {
+    // Only the outline geometry is asserted; the dash pattern is browser art.
   }
 
   fillText(text: string, x: number, y: number): void {
@@ -350,6 +360,89 @@ describe('compositePage', () => {
     )
     expect(blob.type).toBe('image/png')
     expect(linesPainted()).toEqual([{ op: 'fillText', args: ['Fine line', 72, 72] }])
+  })
+})
+
+/**
+ * Clamping at the box — the default sheet's answer to C-03. Geometry never
+ * moves (that is the image export's promise); what changed is that a line the
+ * box cannot hold is no longer painted over the block below, and the block is
+ * *reported* instead of staying silent.
+ */
+describe('compositePage clamping (adjustLayout off)', () => {
+  beforeEach(stubCanvasGlobals)
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  const linesPainted = (): PaintCall[] => painted.filter((call) => call.op === 'fillText')
+  const flagsPainted = (): PaintCall[] => painted.filter((call) => call.op === 'strokeRect')
+
+  it('cuts the lines the box cannot hold and reports the block', async () => {
+    // Forty words are four lines at the 6pt floor with this measurer — 40.8pt
+    // of text in a 14pt box: only the first line's bottom lands inside it,
+    // and the rest must not paint over whatever sits below — silence about
+    // that was the bug.
+    const clipped: string[] = []
+    await compositePage(page([block({ id: 'a', translatedText: words(40) })]), null, {
+      scale: 1,
+      fontStack: '',
+      onClipped: (id) => clipped.push(id),
+    })
+    expect(clipped).toEqual(['a'])
+    expect(linesPainted()).toHaveLength(1)
+    // The survivor starts at the block's own origin: nothing shifted.
+    expect(linesPainted()[0].args[2]).toBe(72)
+  })
+
+  it('stays quiet for a block that fits after auto-fit', async () => {
+    const clipped: string[] = []
+    await compositePage(page([block({ translatedText: 'Hello world' })]), null, {
+      scale: 1,
+      fontStack: '',
+      onClipped: (id) => clipped.push(id),
+    })
+    expect(clipped).toEqual([])
+    expect(linesPainted()).toHaveLength(1)
+  })
+
+  it('keeps source geometry: the overflowing block is not moved', () => {
+    const blocks = [block({ translatedText: words(40) })]
+    const out = layoutBlocks(page(blocks), { scale: 1, fontStack: '' }, measure)
+    expect(out[0]).toBe(blocks[0])
+    expect(out[0].y).toBe(72)
+  })
+
+  it('does not clamp when the reader asked to adjust the layout', async () => {
+    // The push-down made room for exactly this text; cutting here would
+    // delete the words the option exists to save — every line the floor
+    // produced is painted, including the ones past the source box.
+    const clipped: string[] = []
+    await compositePage(page([block({ id: 'a', translatedText: words(40) })]), null, {
+      scale: 1,
+      fontStack: '',
+      adjustLayout: true,
+      onClipped: (id) => clipped.push(id),
+    })
+    expect(clipped).toEqual([])
+    expect(linesPainted()).toHaveLength(4)
+  })
+
+  it('paints the same red flag the HTML export draws for an overflow block', async () => {
+    await compositePage(page([block({ overflow: true, translatedText: 'Flag me' })]), null, {
+      scale: 1,
+      fontStack: '',
+    })
+    expect(flagsPainted()).toEqual([{ op: 'strokeRect', args: [72, 72, 468, 14] }])
+  })
+
+  it('draws no flag on a healthy block', async () => {
+    await compositePage(page([block({ translatedText: 'Fine' })]), null, {
+      scale: 1,
+      fontStack: '',
+    })
+    expect(flagsPainted()).toEqual([])
   })
 })
 

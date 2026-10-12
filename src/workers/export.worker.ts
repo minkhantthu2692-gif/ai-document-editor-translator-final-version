@@ -20,13 +20,19 @@ import { buildDocx } from '@/export/docx'
 import { buildEpub } from '@/export/epub'
 import { buildHtmlDocument, DEFAULT_HTML_OPTIONS } from '@/export/html'
 import { buildJsonDocument } from '@/export/json'
+import { layoutIssues } from '@/export/layoutReport'
 import { buildMarkdown } from '@/export/markdown'
 import { buildRasterPdf, rasterOptionsFrom } from '@/export/pdfRaster'
 import { DEFAULT_FONT_STACK, fileNameFor, isDocumentEmpty } from '@/export/shared'
 import { buildPlainText } from '@/export/text'
 import { buildImagesZip } from '@/export/zipImages'
 import { WORKER_MIME, type ExportBuildRequest, type ExportWorkerResponse } from '@/export/protocol'
-import type { ExportArtifact, ExportIssue, ExportStage } from '@/export/types'
+import type {
+  ExportArtifact,
+  ExportIssue,
+  ExportLayoutMode,
+  ExportStage,
+} from '@/export/types'
 import { containsMyanmar } from '@/lib/text'
 
 const scope = self as unknown as DedicatedWorkerGlobalScope
@@ -90,52 +96,48 @@ async function pageImageUrls(
 
 /**
  * What a layout pass has to say about itself: an estimate the browser would
- * not measure for, and any block the page edge stopped. Every format with
- * geometry to move around — the HTML/print documents, and the raster pair when
- * the reader opted into adjustment — answers the same two questions, so all
- * three report them the same way.
+ * not measure for, and any block the page box could not hold. Every format
+ * with geometry to move around — the HTML/print documents, and the raster pair
+ * whether or not the reader opted into adjustment — answers the same two
+ * questions, so all of them report them the same way (wording in
+ * `export/layoutReport`).
  */
-function reportLayout(issues: ExportIssue[], measured: boolean, clipped: string[]): void {
-  if (!measured) {
-    issues.push({
-      code: 'EXPORT_LAYOUT_ESTIMATED',
-      fonts: [],
-      detail:
-        'this browser gave the export no text measurer, so blocks were re-flowed from an estimated character width and may sit a line out',
-    })
-  }
-  if (clipped.length > 0) {
-    issues.push({
-      code: 'EXPORT_LAYOUT_CLIPPED',
-      fonts: [],
-      count: clipped.length,
-      detail: `${clipped.length} blocks could not be re-flowed: the page box is fixed and the push ran out of edge, so they overlap the block above`,
-    })
-  }
+function reportLayout(
+  issues: ExportIssue[],
+  measured: boolean,
+  clipped: string[],
+  mode?: ExportLayoutMode,
+): void {
+  issues.push(...layoutIssues({ measured, clipped, ...(mode ? { mode } : {}) }))
 }
 
 /**
- * The two callbacks a raster build reports its layout through, plus the call
- * that turns what they collected into issues. `null` when the reader did not
- * ask for adjustment — a sheet that places every block where the PDF put it
- * has no reflow to describe.
+ * The callbacks a raster build reports its layout through, plus the call that
+ * turns what they collected into issues. Always present — even the default
+ * sheet, which places every block where the PDF put it, can find text its box
+ * cannot print, and silence about that was the bug (C-03).
+ *
+ * `onOverlap` fills the list while reflowing (Adjust layout on), `onClipped`
+ * while clamping (off); the option decides which of the two can fire, so a
+ * block is never counted twice.
  */
 interface LayoutReporter {
   onOverlap: (blockId: string) => void
+  onClipped: (blockId: string) => void
   onEstimated: () => void
   finish: () => void
 }
 
-function layoutReporter(issues: ExportIssue[], active: boolean): LayoutReporter | null {
-  if (!active) return null
+function layoutReporter(issues: ExportIssue[], adjustLayout: boolean): LayoutReporter {
   const clipped: string[] = []
   let measured = true
   return {
     onOverlap: (blockId) => clipped.push(blockId),
+    onClipped: (blockId) => clipped.push(blockId),
     onEstimated: () => {
       measured = false
     },
-    finish: () => reportLayout(issues, measured, clipped),
+    finish: () => reportLayout(issues, measured, clipped, adjustLayout ? 'reflow' : 'clamp'),
   }
 }
 
@@ -316,33 +318,34 @@ async function build(request: ExportBuildRequest): Promise<ExportArtifact> {
     }
 
     case 'pdf-raster': {
-      // Placement is measured only when the reader opted into adjustment: the
-      // default sheet paints every block at the y the PDF gave it, so there is
-      // no reflow to report on.
-      const layout = layoutReporter(issues, options.adjustLayout)
+      // Placement is reported in both modes now: with adjustment off the
+      // paint clamps at each box and `onClipped` says what it cut (C-03).
+      const layout = layoutReporter(issues, options.adjustLayout === true)
       const bytes = await buildRasterPdf(doc, images, {
         ...rasterOptionsFrom(options),
-        onOverlap: layout?.onOverlap,
-        onEstimated: layout?.onEstimated,
+        onOverlap: layout.onOverlap,
+        onClipped: layout.onClipped,
+        onEstimated: layout.onEstimated,
         onPage: (done, total) => progress(id, 'render', done, total),
       })
-      layout?.finish()
+      layout.finish()
       blob = new Blob([bytes as BlobPart], { type: WORKER_MIME['pdf-raster'] })
       break
     }
 
     case 'images': {
-      const layout = layoutReporter(issues, options.adjustLayout)
+      const layout = layoutReporter(issues, options.adjustLayout === true)
       const bytes = await buildImagesZip(doc, images, {
         format: options.imageFormat,
         scale: options.imageScale,
         fontStack: options.fontStack,
         adjustLayout: options.adjustLayout,
-        onOverlap: layout?.onOverlap,
-        onEstimated: layout?.onEstimated,
+        onOverlap: layout.onOverlap,
+        onClipped: layout.onClipped,
+        onEstimated: layout.onEstimated,
         onFile: (done, total) => progress(id, 'render', done, total),
       })
-      layout?.finish()
+      layout.finish()
       blob = new Blob([bytes as BlobPart], { type: WORKER_MIME.images })
       break
     }

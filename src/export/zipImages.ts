@@ -21,6 +21,8 @@ export interface ImagesZipOptions {
   adjustLayout?: boolean
   /** Called once per block the page edge stopped while reflowing. */
   onOverlap?: (blockId: string) => void
+  /** Called once per block whose extra lines were cut at the box edge. */
+  onClipped?: (blockId: string) => void
   /** Called once per page measured without a canvas. */
   onEstimated?: () => void
   onFile?: (done: number, total: number) => void
@@ -62,6 +64,7 @@ export async function buildImagesZip(
       ...(options.quality !== undefined ? { quality: options.quality } : {}),
       adjustLayout: options.adjustLayout,
       onOverlap: options.onOverlap,
+      onClipped: options.onClipped,
       onEstimated: options.onEstimated,
     })
     zip.file(file, image)

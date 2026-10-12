@@ -206,10 +206,16 @@ export function ExportDialog({ open, onClose, projectId }: ExportDialogProps) {
         } else if (issue.code === 'EXPORT_LAYOUT_ESTIMATED') {
           toast('warning', t('export.issueLayoutTitle'), t('export.issueLayoutBody'))
         } else if (issue.code === 'EXPORT_LAYOUT_CLIPPED') {
+          // The image exports clamp at the box (`mode: 'clamp'`); everything
+          // else reflowed and parked the block. Different mechanics need
+          // different copy — see export/layoutReport.
+          const clamped = issue.mode === 'clamp'
           toast(
             'warning',
-            t('export.issueClippedTitle', { count: issue.count ?? 0 }),
-            t('export.issueClippedBody'),
+            t(clamped ? 'export.issueClippedImageTitle' : 'export.issueClippedTitle', {
+              count: issue.count ?? 0,
+            }),
+            t(clamped ? 'export.issueClippedImageBody' : 'export.issueClippedBody'),
           )
         } else {
           toast('warning', t('export.issueTitle'), issue.detail)

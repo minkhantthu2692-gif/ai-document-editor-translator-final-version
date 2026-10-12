@@ -256,12 +256,27 @@ export type ExportIssueCode =
    */
   | 'EXPORT_LAYOUT_CLIPPED'
 
+/**
+ * How the block was placed when `EXPORT_LAYOUT_CLIPPED` fired.
+ *
+ * `reflow` — Adjust layout was on and the page-edge push parked the block
+ * (HTML/print, and image exports that opted in): the block overlaps the one
+ * above it. `clamp` — source geometry was kept, so the block's extra lines
+ * were cut at its own box edge (the default image export).
+ *
+ * Absent on issues from older workers and on the HTML path, which always
+ * reflows — readers must treat `undefined` as `reflow`.
+ */
+export type ExportLayoutMode = 'reflow' | 'clamp'
+
 export interface ExportIssue {
   code: ExportIssueCode
   /** Missing font families (only for `EXPORT_FONT_MISSING`). */
   fonts: string[]
   /** How many blocks were affected (only for `EXPORT_LAYOUT_CLIPPED`). */
   count?: number
+  /** Placement mode (only for `EXPORT_LAYOUT_CLIPPED` — see above). */
+  mode?: ExportLayoutMode
   detail: string
 }
 

@@ -1227,6 +1227,8 @@
     "issueLayoutBody": "This browser gave the export no way to measure text, so blocks were re-flowed from an estimated character width. A block may sit a line further down than it needed to — nothing is missing.",
     "issueClippedTitle": "{{count}} blocks could not be re-flowed",
     "issueClippedBody": "The page box is fixed, so they were parked at the bottom edge and overlap the block above. Nothing is missing.",
+    "issueClippedImageTitle": "{{count}} blocks do not fit their box",
+    "issueClippedImageBody": "Image exports keep the PDF's geometry, so each block prints where the PDF put it — the extra lines are cut at the block's edge instead of painting over the block below. Turn on \"Adjust layout when a translation grows\" or edit the block: the full text is still in the document, in the other formats and in the editor.",
     "summary": "{{pages}} pages · {{blocks}} blocks · {{translated}} translated"
   }
 }
