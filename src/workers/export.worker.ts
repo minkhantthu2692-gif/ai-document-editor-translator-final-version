@@ -21,6 +21,10 @@ import { buildEpub } from '@/export/epub'
 import { buildHtmlDocument, DEFAULT_HTML_OPTIONS } from '@/export/html'
 import { buildJsonDocument } from '@/export/json'
 import { layoutIssues } from '@/export/layoutReport'
+import {
+  fontRegistrationIssues,
+  registerWorkerFonts,
+} from '@/export/workerFonts'
 import { buildMarkdown } from '@/export/markdown'
 import { buildRasterPdf, rasterOptionsFrom } from '@/export/pdfRaster'
 import { DEFAULT_FONT_STACK, fileNameFor, isDocumentEmpty } from '@/export/shared'
@@ -186,6 +190,28 @@ async function build(request: ExportBuildRequest): Promise<ExportArtifact> {
       ),
     ),
   ]
+
+  // Register the faces on *this* thread before anything measures: the canvas
+  // measurer and the raster painter read from the worker's FontFaceSet, and
+  // without this they silently fall back to system metrics — wrong line
+  // breaks and wrong Myanmar advances (C-04 / L-03). Only the formats that
+  // actually measure here pay for it; text-only formats never touch a canvas.
+  const measuresHere =
+    options.format === 'pdf' ||
+    options.format === 'bilingual-pdf' ||
+    options.format === 'html' ||
+    options.format === 'pdf-raster' ||
+    options.format === 'images'
+  if (measuresHere) {
+    const registration = await registerWorkerFonts(fontFaces)
+    const hasMyanmar = doc.pages.some((page) =>
+      page.blocks.some((block) => containsMyanmar(block.translatedText)),
+    )
+    issues.push(
+      ...fontRegistrationIssues(registration, { usedFamilies: families, hasMyanmar }),
+    )
+  }
+
   progress(id, 'build', 0, 1)
   const fontCss = await buildFontCss(fontFaces, {
     families: families.length > 0 ? families : null,
