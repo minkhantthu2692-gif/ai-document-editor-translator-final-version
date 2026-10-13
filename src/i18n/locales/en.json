@@ -337,7 +337,7 @@
     },
     "openTranslate": "Translate",
     "editorTitle": "Editor",
-    "editorBody": "Original on the left, translation on the right. Click a block to select it, double-click to edit."
+    "editorBody": "Each page shows the original and its translation. Click a block to select it, double-click to edit."
   },
   "settings": {
     "title": "Settings",
@@ -1114,8 +1114,7 @@
       "retranslate": "Re-translating {{done}}/{{total}}",
       "apply-style": "Applying style {{done}}/{{total}}",
       "find": "Searching {{done}}/{{total}}",
-      "template": "Applying template {{done}}/{{total}}",
-      "autosave": "Saving {{done}}/{{total}}"
+      "template": "Applying template {{done}}/{{total}}"
     },
     "cmd": {
       "editText": "Edit text",

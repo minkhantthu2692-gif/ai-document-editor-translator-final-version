@@ -64,7 +64,7 @@ const DYNAMIC_KEYS: Record<string, string[]> = {
   'editor.view': ['split', 'original', 'translated'],
   'editor.scope': ['block', 'page', 'document'],
   'editor.align': ['left', 'center', 'right', 'justified'],
-  'editor.busy': ['retranslate', 'apply-style', 'find', 'template', 'autosave'],
+  'editor.busy': ['retranslate', 'apply-style', 'find', 'template'],
   'export.format': [
     'pdf',
     'pdf-raster',

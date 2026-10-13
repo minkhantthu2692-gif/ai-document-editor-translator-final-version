@@ -8,6 +8,77 @@ cut — everything under `Unreleased` is work in progress on `main`.
 
 ## [Unreleased]
 
+Phase 05 — UI/UX polish: targeted fixes, identity preserved.
+
+### Added
+
+- **TranslatePage run guard + tests** (task 5.2, closes L-08): `handleStart` flips a
+  synchronous in-flight ref before awaiting `startTranslate` and mirrors it in state — a
+  rapid double activation (double-click, or Start then Resume) reaches the queue once
+  instead of firing a second call that cancelled the first mid-flight. Start/Resume/Fix/
+  Retry all show a real disabled state while the start is pending. New
+  `TranslatePage.test.tsx` (queue mocked at the module boundary): double activation fires
+  one `startTranslate`, the controls disable while pending and re-enable after settle, and
+  a fresh activation is allowed afterwards.
+- **`/workspace` redirect tests** (task 5.1): bare `/workspace` with projects lands in the
+  most recently opened one (deterministic `lastOpenedAt` ordering), a no-projects account
+  still sees the create-project empty state, and archived-only accounts keep it too.
+
+### Changed
+
+- **Bare `/workspace` no longer dead-ends** (task 5.1, closes L-09/C-11): it redirects
+  (`replace`) to the most recently opened non-archived project — the same "recent" order
+  the Projects page uses — with a skeleton while the live query settles; only a truly
+  empty account sees the create-project empty state.
+- **Myanmar script renders in every UI string** (`src/index.css`): the general
+  `--font-sans` stack now lists the app-bundled `Noto Sans Myanmar`/`Padauk` families
+  (@fontsource, already loaded) after the Latin ones. Mixed-script strings — "Burmese —
+  မြန်မာ" in the language selects, project names, log lines — never carry `.mm-text`, and
+  previously fell to the generic `sans-serif` mapping, which renders tofu boxes on any
+  machine whose OS has no Myanmar font. Verified visually in the browser before/after.
+- **Logs total is the true total** (`LogsPage`): derived from the severity counts instead
+  of a `limit: 5000` list read, which understated it on busy accounts ("showing 1000 of
+  5000") and disagreed with the severity chips.
+- **Editor helper copy** (`workspace.editorBody`, en/my): "Original on the left,
+  translation on the right" described only the ≤~45 % zoom layout; the default desktop
+  layout wraps the two panes of a page into a stacked layout. The copy now states what
+  every layout does.
+- **Dead `editor.busy.autosave` kind removed** (flagged in Phase 04): store union member,
+  i18n key (en/my) and the coverage-test pin are gone; the store interface documents why
+  (commits persist on push — a save busy kind would advertise a state that cannot exist).
+
+### Notes
+
+- Gates: `npm run typecheck` ✅, `npm run lint` ✅, full suite **1639 passed / 6 skipped**
+  (109 files passed, 1 env-gated file skipped; +4 tests vs the Phase 04 baseline of 1635).
+- Task 5.3 recorded as a CDP audit over the stable harness profile: 8 routes (projects,
+  new-project, workspace bare + editor, translate, logs, settings, knowledge) × 4
+  viewports (1440×900, 1024×768, 820×1180, 390×844) — no horizontal overflow anywhere
+  (`scrollWidth == clientWidth` on all 32), no console exceptions, one scroll region
+  (`app-scrollbar`) with the nested scrollers being intentional (virtualized editor list,
+  thumbnails, logs list); the bare `/workspace` redirect was confirmed in the real
+  browser. Editor pane artwork loads through the analysis worker; on a 300-page document
+  the first render shows the designed skeleton for ~10 s, then both panes resolve to real
+  images (probe: `naturalWidth 918×1188`, shimmer gone, zero console errors) — the blank
+  panes in early screenshots were the loading state, not a failure.
+- Task 5.4 (controls wired): no inert `onClick` stubs and no `TODO`/"coming soon" markers
+  exist in components (grep); the Phase 02–04 pins still hold (sample-test,
+  pause/cancel/try-now, quota banner, editor toolbar, geometry card); the Logs total is
+  now derived from real counts (above). The Phase 02 diagnostics render live data
+  (API-key ready count, free-tier quota, per-check details) — verified in browser
+  screenshots.
+- Task 5.5 (keyboard/a11y): tab-crawl over the translate page in the browser — Tab 1 is a
+  "Skip to main content" link, then header/sidebar controls in visual order; every one of
+  12 stops reports `:focus-visible` with the 2 px focus ring; icon-only controls carry
+  aria-labels; the controls touched this phase are native buttons/links (disabled state
+  is semantic).
+- The historical `ProjectsPage` bulk-delete flake (noted in Phases 03/04) is fixed: the
+  rows disappear through Dexie's live-query lane while the selection clears in the delete
+  handler's promise continuation — two independent React updates. The assertion now waits
+  for the bar (same pattern as the cancel test); 8/8 consecutive isolated runs green.
+- No export-affecting code changed this phase, so the CDP export harness was not re-run;
+  the Phase 04 evidence (7/7 fixtures) stands.
+
 Phase 04 — pre-export editor: verified, closed genuine gaps, proven through export.
 
 ### Added

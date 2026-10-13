@@ -114,6 +114,8 @@ export function TranslatePage() {
   const [exportOpen, setExportOpen] = useState(false)
   const [sample, setSample] = useState<{ ok: boolean; text: string } | null>(null)
   const [sampleBusy, setSampleBusy] = useState(false)
+  const [startBusy, setStartBusy] = useState(false)
+  const startBusyRef = useRef(false)
 
   const phase: TranslatePhase = progress.phase
   const previousPhase = useRef<TranslatePhase | null>(null)
@@ -386,6 +388,14 @@ export function TranslatePage() {
 
   async function handleStart() {
     if (!config || !projectId) return
+    // L-08: a rapid double activation (double-click, or Start then Resume)
+    // used to fire a second startTranslate that cancelled the first one
+    // mid-flight. The ref flips synchronously, so the second call is gone
+    // before it can reach the queue; the state mirrors it for the disabled
+    // look on every control that leads here (Start/Resume/Fix/Retry).
+    if (startBusyRef.current) return
+    startBusyRef.current = true
+    setStartBusy(true)
     try {
       const outcome = await startTranslate(projectId, config)
       if (outcome.pending === 0) toast('info', t('translate.nothingToTranslate'))
@@ -400,6 +410,9 @@ export function TranslatePage() {
       } else {
         toast('danger', error instanceof Error ? error.message : String(error))
       }
+    } finally {
+      startBusyRef.current = false
+      setStartBusy(false)
     }
   }
 
@@ -563,7 +576,8 @@ export function TranslatePage() {
   }, [config, apiKeys, confirmed])
 
   const blockers = checks.filter((check) => check.status === 'fail')
-  const startDisabled = blockers.length > 0 || !config || !confirmed || phase === 'running'
+  const startDisabled =
+    blockers.length > 0 || !config || !confirmed || phase === 'running' || startBusy
 
   /* ---------------------------------------------------------------- */
   /* Render                                                            */
@@ -655,6 +669,7 @@ export function TranslatePage() {
                       size="sm"
                       variant="secondary"
                       onClick={() => void handleStart()}
+                      disabled={startBusy}
                       data-testid="translate-resume"
                     >
                       {t('translate.resume')}
@@ -665,6 +680,7 @@ export function TranslatePage() {
                       size="sm"
                       variant="primary"
                       onClick={handleFix}
+                      disabled={startBusy}
                       data-testid="translate-fix"
                     >
                       {t('translate.fixResume')}
@@ -675,6 +691,7 @@ export function TranslatePage() {
                       size="sm"
                       variant="secondary"
                       onClick={() => void handleStart()}
+                      disabled={startBusy}
                       data-testid="translate-retry"
                     >
                       {t('translate.retryFailed')}

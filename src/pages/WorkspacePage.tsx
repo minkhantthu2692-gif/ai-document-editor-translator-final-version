@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, Navigate, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useLiveQuery } from 'dexie-react-hooks'
 import { Badge, Button, Card, EmptyState, Stepper } from '@/components/ui'
@@ -91,6 +91,16 @@ export function WorkspacePage() {
   )
   const hasEditor = (blockCount ?? 0) > 0
 
+  // Bare /workspace used to dead-end on the create-project empty state even
+  // with projects on file (L-09). It now lands in the most recently opened
+  // project — the same "recent" order the Projects page uses, archived
+  // projects excluded — and only a truly empty account sees the empty state.
+  // `undefined` = the live query has not settled yet (vs `[]` = no projects).
+  const recentProjects = useLiveQuery(
+    async () => (projectId ? [] : projectRepo.list({ sort: 'recent', limit: 1 })),
+    [projectId],
+  )
+
   const machine = machineRef.current
 
   useEffect(() => {
@@ -181,18 +191,29 @@ export function WorkspacePage() {
       />
 
       {!projectId ? (
-        <EmptyState
-          title={t('projects.emptyTitle')}
-          body={t('projects.emptyBody')}
-          icon={<IconWorkspace className="h-10 w-10" />}
-          action={
-            <Link to="/projects/new">
-              <Button variant="primary" size="sm">
-                {t('projects.createFirst')}
-              </Button>
-            </Link>
-          }
-        />
+        recentProjects === undefined ? (
+          <Card>
+            <div className="flex flex-col gap-3">
+              <div className="skeleton-shimmer h-4 w-1/3 rounded-md" />
+              <div className="skeleton-shimmer h-24 w-full rounded-md" />
+            </div>
+          </Card>
+        ) : recentProjects.length > 0 ? (
+          <Navigate to={`/workspace/${recentProjects[0].id}`} replace />
+        ) : (
+          <EmptyState
+            title={t('projects.emptyTitle')}
+            body={t('projects.emptyBody')}
+            icon={<IconWorkspace className="h-10 w-10" />}
+            action={
+              <Link to="/projects/new">
+                <Button variant="primary" size="sm">
+                  {t('projects.createFirst')}
+                </Button>
+              </Link>
+            }
+          />
+        )
       ) : project === undefined ? (
         <Card>
           <div className="flex flex-col gap-3">

@@ -40,7 +40,16 @@
 
   --shadow-panel: 0 1px 2px rgb(16 24 40 / 0.06);
 
-  --font-sans: 'Inter', 'Roboto', 'Noto Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  /* The Myanmar families sit in the general stack too, not only in --font-mm:
+     mixed-script strings — "Burmese — မြန်မာ" in the language selects, project
+     names, log lines — never carry .mm-text, and without a Myanmar family in
+     the chain they fall to the generic sans-serif mapping, which renders tofu
+     boxes on any machine whose OS has no Myanmar font. Both families already
+     ship with the app via @fontsource (src/styles/fonts.ts), so the fallback
+     is deterministic everywhere; Latin glyphs are unaffected. */
+  --font-sans:
+    'Inter', 'Roboto', 'Noto Sans', system-ui, -apple-system, 'Segoe UI', 'Noto Sans Myanmar', 'Padauk',
+    sans-serif;
   --font-serif: 'Source Serif 4', 'Noto Serif', Georgia, 'Times New Roman', serif;
   --font-mm: 'Noto Sans Myanmar', 'Padauk', 'Myanmar Text', 'Padauk-f', sans-serif;
   --font-mono:

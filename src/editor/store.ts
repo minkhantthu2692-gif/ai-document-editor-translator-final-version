@@ -21,9 +21,15 @@ import { EMPTY_FIND, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP, trimStack } from './types'
 
 export type InspectorTab = 'block' | 'history' | 'document'
 
-/** Progress of a long-running editor action (re-translate, apply, import). */
+/**
+ * Progress of a long-running editor action (re-translate, apply, import).
+ *
+ * Deliberately no "save"/"autosave" kind: every commit persists to Dexie
+ * before the command stack push (Phase 4), so there is no unsaved window to
+ * report — a busy kind for it would advertise a state that cannot exist.
+ */
 export interface EditorBusy {
-  kind: 'retranslate' | 'apply-style' | 'find' | 'template' | 'autosave'
+  kind: 'retranslate' | 'apply-style' | 'find' | 'template'
   done: number
   total: number
   /** 0..1 */

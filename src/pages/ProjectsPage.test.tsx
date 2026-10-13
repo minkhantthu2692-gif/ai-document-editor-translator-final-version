@@ -67,7 +67,11 @@ describe('ProjectsPage bulk delete', () => {
 
     await waitFor(() => expect(screen.queryByTestId('project-select')).toBeNull())
     expect(await db.projects.count()).toBe(0)
-    expect(screen.queryByTestId('bulk-actions')).toBeNull()
+    // The rows disappear through Dexie's live-query lane while the selection
+    // clears in the delete handler's promise continuation — two independent
+    // React updates whose render order is not deterministic, so wait for the
+    // bar rather than sampling in between (same pattern as the cancel test).
+    await waitFor(() => expect(screen.queryByTestId('bulk-actions')).toBeNull())
   })
 
   it('cancelling the bulk confirm deletes nothing', async () => {

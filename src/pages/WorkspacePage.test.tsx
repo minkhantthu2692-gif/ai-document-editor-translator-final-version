@@ -1,13 +1,14 @@
 /**
- * Discoverability (Phase 4, task 4.1): where the editor lives and when it
- * mounts.
+ * Discoverability (Phase 4, task 4.1; Phase 5.1 for the bare route): where
+ * the editor lives and when it mounts.
  *
  * The written verdict is in `AUDIT_REPORT.md` §7.3; this file pins its factual
  * half at the route level — `/workspace/:projectId` opens the editor as soon
- * as the project has blocks, the bare `/workspace` entry shows the
- * create-project empty state instead (finding C-11), and a project with no
- * blocks yet keeps the pipeline as the primary view rather than an empty
- * editor.
+ * as the project has blocks, the bare `/workspace` entry redirects into the
+ * most recently opened project (findings C-11/L-09) and shows the
+ * create-project empty state only when there is nothing to open, and a
+ * project with no blocks yet keeps the pipeline as the primary view rather
+ * than an empty editor.
  *
  * `react-virtuoso` is mocked flat, exactly like `WorkspaceEditor.test.tsx`:
  * jsdom has no layout for the virtualiser to measure. The route/mount
@@ -97,11 +98,49 @@ describe('WorkspacePage discoverability', () => {
     cleanup()
   })
 
-  it('shows the create-project empty state on bare /workspace, with no editor', async () => {
+  it('shows the create-project empty state on bare /workspace when no projects exist', async () => {
     renderAt('/workspace')
 
     expect(await screen.findByText(label('projects.emptyTitle'))).toBeInTheDocument()
     expect(screen.queryByTestId('workspace-editor')).toBeNull()
+  })
+
+  it('redirects bare /workspace to the most recently opened project (5.1)', async () => {
+    const older = await projectRepo.create({
+      name: 'Older project',
+      sourceLang: 'en',
+      targetLang: 'my',
+    })
+    const recent = await projectRepo.create({
+      name: 'Recent project',
+      sourceLang: 'en',
+      targetLang: 'my',
+    })
+    // Deterministic recency regardless of creation order or clock ties:
+    // `lastOpenedAt` is a timestamp, so the higher value is the more recent.
+    await projectRepo.update(older.id, { lastOpenedAt: 1_000 })
+    await projectRepo.update(recent.id, { lastOpenedAt: 2_000 })
+
+    renderAt('/workspace')
+
+    expect(await screen.findByText('Recent project')).toBeInTheDocument()
+    expect(screen.queryByText(label('projects.emptyTitle'))).toBeNull()
+    // The recent project has no blocks, so the pipeline stays the primary
+    // view — the redirect opens the project, it does not force an editor.
+    expect(screen.queryByTestId('workspace-editor')).toBeNull()
+  })
+
+  it('keeps the empty state when every project is archived (5.1)', async () => {
+    const project = await projectRepo.create({
+      name: 'Archived',
+      sourceLang: 'en',
+      targetLang: 'my',
+    })
+    await projectRepo.archive(project.id, true)
+
+    renderAt('/workspace')
+
+    expect(await screen.findByText(label('projects.emptyTitle'))).toBeInTheDocument()
   })
 
   it('opens the editor at /workspace/:projectId once the project has blocks', async () => {

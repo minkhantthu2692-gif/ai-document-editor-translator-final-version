@@ -168,6 +168,24 @@ they added must be real). **Touches:** `src/components/layout/*`, `src/pages/*` 
 
 **Rollback:** each UI change is a small diff; revert individually. Do **not** restyle.
 
+**Status (2026-10-13): complete.** 5.1 landed as a `<Navigate replace>` into the most
+recently opened non-archived project (pinned by three route tests, and confirmed in the
+real browser over CDP); the create-project empty state now means "nothing to open".
+5.2 landed as a synchronous `startBusyRef` guard in `handleStart` plus a disabled
+`startBusy` state on Start/Resume/Fix/Retry, pinned by a new `TranslatePage.test.tsx`
+(queue mocked at the module boundary). 5.3 was recorded as a CDP audit — 8 routes × 4
+viewports (1440×900, 1024×768, 820×1180, 390×844): one document-scroll region
+everywhere, no horizontal overflow in any of the 32 combinations, no console exceptions,
+clean 390 px collapse; the audit surfaced a real defect (mixed-script UI strings rendered
+as tofu because `--font-sans` carried no Myanmar family) which is fixed by listing the
+already-bundled `@fontsource` families. 5.4: no inert `onClick` stubs or "coming soon"
+markers exist, the Phase 02 diagnostics render live values, and the Logs total was
+re-derived from the severity counts (a capped list read understated it). 5.5: a browser
+tab-crawl put "Skip to main content" first and showed the 2 px focus ring on 12/12 stops.
+Also closed: the recurring `ProjectsPage` bulk-delete flake (two independent React update
+lanes; the assertion now waits) and the vestigial `editor.busy.autosave` kind. No
+export-affecting code changed, so the Phase 04 harness evidence stands.
+
 ## 7. Phase 06 — Regression & release readiness (`PHASE-06-TEST-RELEASE.md`)
 
 1. Run the real commands and record results: `npm run lint`, `npm run typecheck`,

@@ -484,6 +484,77 @@ Changed files: `src/editor/types.ts` (BlockFields geometry), `src/editor/command
 `src/pages/WorkspacePage.test.tsx` (new, route discoverability),
 `scripts/validate-export.mjs` (edit round-trip, Node-side pdfText, `--skip-edit`).
 
+### 7.4 Phase 05 resolutions (2026-10-13)
+
+- **L-09 → fixed (5.1).** Bare `/workspace` now resolves through a live query of the most
+  recently opened non-archived project (`projectRepo.list({ sort: 'recent', limit: 1 })` —
+  the same order the Projects page uses) and `<Navigate replace>`s into it; while the
+  query settles a skeleton shows, and a genuinely empty account — or one whose only
+  projects are archived — keeps the create-project empty state. Route tests pin all three
+  cases (`WorkspacePage.test.tsx`); the redirect was additionally confirmed in the real
+  browser over CDP (bare `/workspace` → `/workspace/prj_…`). "Most recently opened"
+  tracks `lastOpenedAt`, which the Projects page updates on open.
+- **L-08 → fixed (5.2).** `handleStart` guards on a synchronous ref (mirrored to state)
+  before awaiting `startTranslate`; a second activation inside the await window returns
+  immediately, so a double-click can no longer fire a run that cancels the first one
+  mid-flight. Start (`startDisabled`), Resume, Fix and Retry are disabled while pending.
+  `TranslatePage.test.tsx` (new; queue mocked at the module boundary, no network) pins:
+  one call for a double activation, disabled while pending, re-enabled after settle, and
+  a sequential second start allowed.
+- **Myanmar script in the UI (found in 5.3, fixed).** Mixed-script UI strings — "Burmese —
+  မြန်မာ" in the language selects and the preflight Languages check — rendered as tofu
+  boxes: `--font-sans` had no Myanmar family, so those glyphs fell through to the generic
+  `sans-serif` mapping, which only resolves when the OS itself ships a Myanmar font. The
+  app has bundled `Noto Sans Myanmar`/`Padauk` via `@fontsource` since the baseline
+  (`src/styles/fonts.ts`); they are now appended to the general stack, making the
+  fallback deterministic on every machine. Before/after browser screenshots recorded;
+  Latin glyphs and `.mm-text`/`--font-mm` are unaffected.
+- **Logs total accuracy (found in 5.4, fixed).** `totalCount` was read as a
+  `limit: 5000` list — understating the count on busy accounts and disagreeing with the
+  severity chips next to it. It is now the sum of `countBySeverity()` (all five keys,
+  zero-filled), and the extra query is gone.
+- **Editor helper copy (5.3).** `workspace.editorBody` (en/my) described a left/right pane
+  layout that only holds at ≤~45 % zoom; the default desktop layout wraps a page's two
+  panes into a stacked layout (`flex-wrap` with two 612 pt panes in an ~820 px card). The
+  copy now describes what every layout does; the wrap itself is deliberate — panes keep
+  page fidelity at any width.
+- **Vestigial `editor.busy.autosave` (carry-over from §7.3) → removed.** No setter ever
+  existed; the store union member, the en/my key and the coverage-test pin are deleted,
+  and the store interface documents why (commits persist on push — there is no unsaved
+  window to report).
+- **Scroll/blank-space audit (5.3).** CDP audit over the stable harness profile: 8 routes
+  × 4 viewports (1440×900, 1024×768, 820×1180, 390×844), metrics + screenshots.
+  Results: exactly one document-flow scroll region (`app-scrollbar`) on every page; the
+  nested scrollers are intentional (virtualized editor list, thumbnails, logs list capped
+  at 1000 rows); no horizontal overflow in any of the 32 combinations
+  (`scrollWidth == clientWidth`); no console exceptions; the responsive collapse at
+  390 px is clean (bottom nav bar, wrapping toolbar, overlay sidebar). Editor panes show
+  the designed skeleton while the analysis worker parses the document — on `text-300p`
+  both panes resolve to real artwork after ~10 s (probe: `918×1188` images, shimmer gone,
+  zero errors), so the blank panes in early screenshots were the loading state, not a
+  failure. Document-level trailing-gap readings were an artifact of measuring outside the
+  app's internal scroll region.
+- **Keyboard/a11y (5.5).** Browser tab-crawl over `/translate/:id`: Tab 1 is the
+  "Skip to main content" link, then header and sidebar controls in visual order; 12/12
+  stops report `:focus-visible` with the global 2 px focus ring; icon-only header
+  controls carry `aria-label`s. The controls touched this phase are native buttons/links,
+  so disabled state is semantic.
+- **`ProjectsPage` bulk-delete flake → fixed.** Reproduced in isolation (not load-only):
+  the card list empties through Dexie's live-query lane while the selection clears in
+  `deleteSelectedProjects`'s promise continuation — two independent React updates with no
+  guaranteed render order. The test now waits for the bulk bar (the same pattern the
+  cancel test already used); 8/8 consecutive isolated runs green and the full suite green.
+
+Changed files: `src/pages/WorkspacePage.tsx` (+ `WorkspacePage.test.tsx`, redirect),
+`src/pages/TranslatePage.tsx` (+ new `TranslatePage.test.tsx`, run guard),
+`src/index.css` (Myanmar fallback in `--font-sans`), `src/pages/LogsPage.tsx` (true
+total), `src/i18n/locales/{en,my}.json` (helper copy, `busy.autosave` removal),
+`src/editor/store.ts` (union member removal + doc comment), `src/i18n/coverage.test.ts`
+(pinned list), `src/pages/ProjectsPage.test.tsx` (flake fix).
+
+No export-affecting code changed in this phase, so the CDP export harness was not
+re-run; the Phase 04 evidence (7/7 fixtures `edit:ok`, §7.3) stands.
+
 ## 8. Findings — Unknown (need credentials / browser / data)
 
 - **U-01** Real provider rate-limit, quota and header behaviour per model. The harness

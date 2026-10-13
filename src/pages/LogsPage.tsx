@@ -55,10 +55,13 @@ export function LogsPage() {
     [active.join(','), search],
   )
   const counts = useLiveQuery(() => eventRepo.countBySeverity(), [])
-  const total = useLiveQuery(() => eventRepo.list({ limit: 5000 }), [])
 
   const rows = events ?? []
-  const totalCount = total?.length ?? 0
+  // The real total comes from the severity counts. Reading it as a capped
+  // list (`limit: 5000`) understated it on busy accounts — "showing 1000 of
+  // 5000" when more existed — while the severity chips already summed the
+  // true counts, so the two disagreed with each other.
+  const totalCount = counts ? Object.values(counts).reduce((sum, n) => sum + n, 0) : 0
 
   function toggleSeverity(severity: Severity) {
     setActive((current) =>
