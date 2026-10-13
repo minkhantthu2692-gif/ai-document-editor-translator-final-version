@@ -1,0 +1,8 @@
+# Upload scope for `vercel deploy`. Everything here is either reinstalled by
+# `npm ci`, rebuilt by `npm run build` (tsc --noEmit && vite build), or is a
+# local verification artifact that must never ship.
+node_modules
+dist
+validate-out
+.git
+*.log
