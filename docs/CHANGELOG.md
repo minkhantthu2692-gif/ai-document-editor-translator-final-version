@@ -8,6 +8,69 @@ cut — everything under `Unreleased` is work in progress on `main`.
 
 ## [Unreleased]
 
+Phase 04 — pre-export editor: verified, closed genuine gaps, proven through export.
+
+### Added
+
+- **Position & size editing** (brief: "adjust text-block position and dimensions where the
+  export strategy supports it"): a geometry card in the inspector's Block tab — X/Y/W/H
+  numeric fields, validated on entry (finite, x/y ≥ 0, w/h ≥ 1, rounded to 2 dp) and
+  committed through the same command stack as text edits, so a layout nudge is auto-saved,
+  undoable and revision-logged (`edit-layout`). `x/y/width/height` joined `WRITABLE_FIELDS`
+  and `BlockFields`; the absolute export layout already reads exactly those fields
+  (`collect.ts` → `left`/`top`/`width`), so no second document model was introduced.
+- **Edit round-trip in the export-validation harness** (`scripts/validate-export.mjs`, on
+  by default; `--skip-edit` opts out): per fixture it double-clicks a translated block in
+  the real editor UI, types a unique marker, exports through the same `runExport` the
+  dialog uses, asserts the marker in the print HTML artifact *and* in the text layer of
+  the PDF Chrome prints from it (Node-side pdf.js legacy-build extraction), then presses
+  Ctrl+Z through the editor's own window handler and asserts the original text is back —
+  with a direct-row-restore fallback that reports failure, so a broken undo can never
+  leave a fixture dirty. Target selection prefers an already-mounted virtualized row and
+  walks the editor's inner scroller otherwise.
+- **Phase 04 tests** (+9; see Notes): route-level discoverability (`WorkspacePage.test.tsx`
+  — bare `/workspace` shows the project empty state and no editor; `/workspace/:projectId`
+  mounts the editor once `blockCount > 0`; a block-less project keeps the pipeline as
+  primary view); a full round-trip in `WorkspaceEditor.test.tsx` (inline text edit +
+  toolbar font size → unmount/remount → `collectExportDocument` → `buildHtmlDocument`
+  asserts both edits in the exported markup); the 4.3 editor-side race assertion
+  (`status: 'edited'` written with the text); the typing guard (Ctrl+Z mid-typing leaves
+  the stack alone); the overflow badge on a deliberately overflowing block; geometry
+  commit → export → undo plus invalid-value rejection (`BlockInspector.test.tsx`); a
+  keyboard-map pin.
+
+### Changed
+
+- **Keyboard shortcuts**: removed the inert `save` (Ctrl+S) entry — it sat in the shortcut
+  map and in `shouldPreventDefault`, so the browser default was swallowed while no
+  handler existed. Every edit already persists through the command stack (auto-save on
+  commit), so a save key had nothing to do; the entry was removed rather than left
+  looking functional. `keyboard.test.ts` pins the map.
+
+### Notes
+
+- Gates: `npm run typecheck` ✅, `npm run lint` ✅, full suite **1635 passed / 6 skipped**
+  (108 files passed, 1 env-gated file skipped; +9 tests vs the Phase 03 baseline of 1626).
+- Export-content assertions in jsdom run at the `collectExportDocument` →
+  `buildHtmlDocument` boundary (the exact composition `runExport` performs). A probe
+  confirmed `runExport` itself cannot complete under jsdom — `ExportBuildError: export
+  worker unavailable: Worker is not defined` (no `Worker` global) — so the full
+  `runExport` → print → PDF path is proven in the real browser by the harness step above.
+- Harness evidence (browser, task 4.2): the full plan was run with the final harness —
+  all seven fixtures pass the edit round-trip end to end
+  (`saved=true status=true html=true pdf=true undo=true`, `errors=none`), including the
+  synthetic-scanned fixture and `text-300p` (four pages scoped); the standard
+  raster/adjust/print exports stayed green in the same runs.
+- The 4.3 race guarantee pairs with Phase 02's `persistLines` skip (`resume.test.ts`): a
+  translation response landing after an edit sees `status: 'edited'` and does not
+  overwrite it.
+- There is no "unsaved changes" state to warn about: every commit persists to Dexie
+  before the stack push (auto-save on commit). The `busy.autosave` i18n key is vestigial
+  (no call site) — left in place and flagged for the Phase 05 UI pass.
+- Known limitations carried forward unchanged (see Phase 03 notes), plus: the bare
+  `/workspace` route shows the create-project empty state rather than a dedicated
+  "open a project to edit" hint — deferred to Phase 05/5.1.
+
 Phase 03 — PDF layout reconstruction, export quality and visual validation.
 
 ### Added

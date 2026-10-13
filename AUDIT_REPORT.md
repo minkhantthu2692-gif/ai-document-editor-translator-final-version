@@ -389,6 +389,101 @@ no stored block carried `overflow: true`, so no red dashed flags were expected a
 (flag machinery unit-tested); print exports keep the source page image as background by
 design, so page-image artifacts remain visible there.
 
+### 7.3 Phase 04 resolutions (2026-10-13)
+
+Code changes were made in Phase 04 (tasks 4.1-4.4). Scope: the pre-export editor and its
+export path only — no provider, pipeline or layout changes.
+
+**4.1 Discoverability verdict (C-11 answered; test-pinned).** The editor is neither
+missing nor hidden: `/workspace/:projectId` mounts `WorkspaceEditor` as the primary view
+whenever the project has at least one block — the mount condition `blockCount > 0` the
+plan asked to confirm — and the workspace is reachable from five places: the Projects
+page (project card), the Translate page after a job, the Preview tab, the
+post-translation toast action, and direct URL. The bare `/workspace` route shows the
+create-project empty state (with the project picker below it), not an editor with no
+document; a project whose parse produced zero blocks keeps the pipeline (OCR/language)
+as the primary view and shows no editor. Verified by `WorkspacePage.test.tsx` (three
+route assertions). Caveat carried to Phase 05: the bare-route empty state is functional
+but generic; task 5.1 may give it an explicit "open a project to edit" framing (L-09
+deferred per the plan).
+
+**4.2 Round-trip persistence (C-05 closed).** Edits persist across unmount/remount,
+navigation and export, through one model end to end (no second document model): inline
+text and toolbar changes commit through `commitCommand` → Dexie → live query →
+`collectExportDocument` → `buildHtmlDocument`/print. Evidence:
+
+- unit (`WorkspaceEditor.test.tsx`): inline text edit + toolbar font size 14pt →
+  unmount/remount → exported HTML contains the edited text, `font-size:14pt` and the
+  block's `left/top/width` geometry;
+- unit (`BlockInspector.test.tsx`): geometry change (y=200, width=320.5) → Dexie →
+  exported markup contains `top:200pt;width:320.5pt` → undo restores the original;
+- browser (harness edit round-trip, all seven fixtures): a marker typed into a block
+  through the real UI survives `runExport` into the print HTML artifact and into the
+  text layer of the PDF Chrome prints from that HTML; Ctrl+Z afterwards restores the
+  original text.
+
+Limitation, honestly stated: `runExport` itself cannot run under jsdom — a probe
+(`ExportBuildError: export worker unavailable: Worker is not defined`) shows preflight,
+collect and the empty check all pass and only the `Worker` global is missing — so the
+unit tests assert the collect → HTML boundary (the exact composition `runExport`
+performs), while the browser harness covers the full `runExport` → print → PDF path.
+Both were run; neither is claimed without evidence.
+
+**4.3 Late-response race (L-06, pairs with 2.4).** The editor-side half is now
+test-pinned: an inline commit writes `status: 'edited'` synchronously with the text
+(`WorkspaceEditor.test.tsx` asserts it), and Phase 02's `persistLines` skips
+`status === 'edited'` blocks (`resume.test.ts`), so a translation response landing after
+an edit cannot overwrite it. The browser round-trip additionally asserts
+`status: 'edited'` after each real UI edit (`status=true` for all fixtures).
+
+**4.4 Overflow, shortcuts, undo/redo, unsaved state — verified and documented, not
+rebuilt.**
+
+- Overflow: a 100×10pt block holding long text renders the warning badge, and a wide
+  468×120pt block does not (`WorkspaceEditor.test.tsx`; jsdom falls back to the
+  deterministic 0.52em measurer).
+- Keyboard (documented + pinned): Ctrl/Cmd on the modifier — undo Ctrl+Z, redo
+  Ctrl+Shift+Z, find Ctrl+F, replace Ctrl+H, select all Ctrl+A, bold Ctrl+B, italic
+  Ctrl+I, zoom in Ctrl+=, out Ctrl+-, reset Ctrl+0, export Ctrl+Shift+E; Escape cancels
+  editing; Enter / Shift+Enter and ArrowDown / ArrowUp walk matches and blocks;
+  Ctrl+Enter / Ctrl+Backspace accept/reject a suggestion. While typing inside a block
+  only find/replace/export fire. The previously inert Ctrl+S entry was removed (it was
+  swallowed by `shouldPreventDefault` with no handler behind it) and `keyboard.test.ts`
+  pins the map.
+- Undo/redo: stack-driven and exact for text, styling, geometry and reloads; Ctrl+Z
+  mid-typing is ignored (typing-guard test).
+- Unsaved state: none exists by design — auto-save on commit (the Dexie write precedes
+  the stack push); the `busy.autosave` i18n key is vestigial (no call site), left for
+  the Phase 05 pass.
+
+**Position/dimension editing (brief item).** The geometry card (inspector → Block tab)
+edits X/Y/W/H numerically — deliberately no drag: keyboard-friendly, undoable, same
+command stack as text. Inputs reject non-finite values, negative x/y and w/h below 1,
+round to 2 dp, and Save stays disabled while a field is invalid (`geom-invalid` shown) —
+both directions pinned in `BlockInspector.test.tsx`.
+
+**Harness edit round-trip (task 4.2 browser evidence).** Once per fixture (opt out with
+`--skip-edit`): pick a mock-translated paragraph on an exported page (preferring a row
+the virtualized list has mounted, otherwise walking the editor's inner scroller until it
+mounts), double-click it, type a unique marker, let the real commit path run (inline
+commit → command stack → Dexie, `status: 'edited'`), export through the same `runExport`
+the dialog calls, assert the marker in the print HTML and in the printed PDF's text
+layer (Node-side pdf.js legacy build; the in-page mainline build proved
+environment-sensitive and was replaced), then Ctrl+Z via the editor's own window handler
+and assert the original text is back. If the shortcut ever fails, the row is rewritten
+directly and the failure is reported, so a fixture is never left dirty for later runs.
+Full plan with the final harness: 7/7 fixtures `edit:ok`, `errors=none`, standard
+exports green in the same runs (§12).
+
+Changed files: `src/editor/types.ts` (BlockFields geometry), `src/editor/commands.ts`
+(WRITABLE_FIELDS geometry), `src/db/types.ts` (`edit-layout` revision action),
+`src/editor/keyboard.ts` + `keyboard.test.ts` (inert `save` removed, map pinned),
+`src/i18n/locales/{en,my}.json` (geometry labels, layout command, action label),
+`src/pages/workspace/BlockInspector.tsx` + tests (geometry card),
+`src/pages/workspace/WorkspaceEditor.test.tsx` (round-trip, race, guard, overflow),
+`src/pages/WorkspacePage.test.tsx` (new, route discoverability),
+`scripts/validate-export.mjs` (edit round-trip, Node-side pdfText, `--skip-edit`).
+
 ## 8. Findings — Unknown (need credentials / browser / data)
 
 - **U-01** Real provider rate-limit, quota and header behaviour per model. The harness
@@ -496,3 +591,16 @@ timing test was observed once under load and was green on re-run, in isolation, 
 the next full run — untouched file, unrelated to this phase. Provider-side items
 (U-01, U-05) still need live keys; the OFL note for the bundled fonts is still
 outstanding. Phase 04 (pre-export editor) may proceed.
+
+Phase 04 (2026-10-13) is complete: tasks 4.1-4.4. The editor exists, is reachable (five
+entry points; mount gate `blockCount > 0` confirmed), and its changes persist through
+export via one model (§7.3). Genuinely missing scope was closed: position/size editing
+(geometry card → command stack → Dexie → export), the editor-side race assertion (pairs
+with Phase 02's `persistLines` skip), and a browser-level edit round-trip in the
+harness. The inert Ctrl+S shortcut was removed and the map documented. Full-plan harness
+with the final code: 7/7 fixtures `edit:ok`, `errors=none` (marker in print HTML and in
+the printed PDF's text layer, Ctrl+Z restore verified per fixture), standard exports
+green in the same runs. Final gates: `typecheck` ✅, `lint` ✅, full suite ✅ 1635
+passed / 6 skipped (108/109 files; the 1 skipped file remains the env-gated
+`VERIFY_LIVE=1` suite). Provider-side items (U-01, U-05) and the OFL note remain
+outstanding and are unchanged by this phase. Phase 05 (UI/UX polish) may proceed.

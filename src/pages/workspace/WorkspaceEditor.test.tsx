@@ -18,6 +18,9 @@ import { I18nextProvider } from 'react-i18next'
 import i18n from '@/i18n'
 import { AppDatabase, setDb } from '@/db/db'
 import { blockRepo, pageRepo } from '@/db/repo-content'
+import { projectRepo } from '@/db/repo-projects'
+import { collectExportDocument } from '@/export/collect'
+import { buildHtmlDocument, DEFAULT_HTML_OPTIONS } from '@/export/html'
 import { useEditorStore, resetEditorStore } from '@/editor/store'
 import { WorkspaceEditor } from './WorkspaceEditor'
 
@@ -79,10 +82,10 @@ async function seed(): Promise<string[]> {
   return [first.id, second.id]
 }
 
-function mount(): ReturnType<typeof render> {
+function mount(projectId = PROJECT_ID): ReturnType<typeof render> {
   return render(
     <I18nextProvider i18n={i18n}>
-      <WorkspaceEditor projectId={PROJECT_ID} />
+      <WorkspaceEditor projectId={projectId} />
     </I18nextProvider>,
   )
 }
@@ -156,6 +159,11 @@ describe('WorkspaceEditor', () => {
     await waitFor(async () => {
       const record = await blockRepo.get(first)
       expect(record?.translatedText).toBe('edited through the workspace')
+      // Editor-side half of the late-response guard (task 4.3): a manual edit
+      // marks the block `edited`, which is exactly the state `persistLines`
+      // skips — a translation response that lands afterwards can never
+      // overwrite the user's text (that skip is pinned in resume.test.ts).
+      expect(record?.status).toBe('edited')
     })
     // The commit continues after the block write — history rows, then the
     // stack — so the stack is awaited the same way the write was.
@@ -201,5 +209,167 @@ describe('WorkspaceEditor', () => {
     view.unmount()
     expect(useEditorStore.getState().selection).toEqual([])
     expect(useEditorStore.getState().projectId).toBeNull()
+  })
+
+  /**
+   * Task 4.2 — the round trip: an edit made in the UI (text inline, size via
+   * the toolbar) survives a navigation (unmount + remount) and is present in
+   * the exported artifact, not just in the preview.
+   */
+  it('round-trips text and font size through a remount into the exported HTML', async () => {
+    const project = await projectRepo.create({
+      name: 'Round trip',
+      sourceLang: 'en',
+      targetLang: 'my',
+    })
+    const page = await pageRepo.upsert({
+      projectId: project.id,
+      index: 0,
+      width: 612,
+      height: 792,
+    })
+    const block = await blockRepo.upsert({
+      projectId: project.id,
+      pageId: page.id,
+      order: 0,
+      sourceText: SOURCE,
+      translatedText: TRANSLATION,
+      x: 72,
+      y: 90,
+      width: 468,
+      height: 40,
+    })
+
+    // 1. Inline text edit — committed through the command stack on blur.
+    const view = mount(project.id)
+    fireEvent.dblClick(await blockNode(view.container, block.id))
+    const editor = await screen.findByTestId('block-editor')
+    editor.textContent = 'edited through the workspace'
+    fireEvent.blur(editor)
+    await waitFor(async () => {
+      const row = await blockRepo.get(block.id)
+      expect(row?.translatedText).toBe('edited through the workspace')
+      expect(row?.status).toBe('edited')
+    })
+
+    // 2. Font size through the toolbar dropdown (select → apply → Dexie).
+    fireEvent.click(await blockNode(view.container, block.id))
+    fireEvent.click(screen.getByTestId('font-size'))
+    fireEvent.click(await screen.findByRole('menuitem', { name: '14 pt' }))
+    await waitFor(async () => {
+      const row = await blockRepo.get(block.id)
+      expect(row?.fontSize).toBe(14)
+      expect(row?.fontSizeMode).toBe('custom')
+    })
+
+    // 3. Navigate away and back: nothing about the edit lived only in
+    //    component state.
+    view.unmount()
+    const back = mount(project.id)
+    expect(await screen.findByText('edited through the workspace')).toBeInTheDocument()
+    back.unmount()
+
+    // 4. The exported artifact carries the same edits (collect is the exact
+    //    projection the export worker consumes; buildHtmlDocument is the
+    //    html/pdf print source).
+    const doc = await collectExportDocument({ projectId: project.id })
+    const exported = doc.pages[0].blocks.find((entry) => entry.id === block.id)
+    expect(exported).toMatchObject({
+      translatedText: 'edited through the workspace',
+      fontSize: 14,
+      x: 72,
+      y: 90,
+      width: 468,
+    })
+    const html = buildHtmlDocument(doc, { ...DEFAULT_HTML_OPTIONS, title: project.name })
+    expect(html).toContain('edited through the workspace')
+    expect(html).toContain('font-size:14pt')
+    expect(html).toContain('left:72pt;top:90pt;width:468pt')
+  })
+
+  /**
+   * Task 4.4 — the keyboard guard: document shortcuts must not fire while a
+   * person is typing (Ctrl+Z inside the inline editor is the browser's text
+   * undo, not the document undo).
+   *
+   * jsdom does not implement `isContentEditable` on any element, so the
+   * platform property is stubbed here — the handler line under test is the
+   * real one the browser executes.
+   */
+  it('leaves Ctrl+Z to the browser while typing in the inline editor', async () => {
+    const [first] = await seed()
+    const { container } = mount()
+
+    // One committed edit, so the document undo stack is non-empty.
+    fireEvent.dblClick(await blockNode(container, first))
+    const firstEditor = await screen.findByTestId('block-editor')
+    firstEditor.textContent = 'first edit'
+    fireEvent.blur(firstEditor)
+    await waitFor(async () => {
+      expect((await blockRepo.get(first))?.translatedText).toBe('first edit')
+      expect(useEditorStore.getState().undoStack).toHaveLength(1)
+    })
+
+    // Start a second edit and press Ctrl+Z mid-typing.
+    fireEvent.dblClick(await blockNode(container, first))
+    const editor = await screen.findByTestId('block-editor')
+    editor.textContent = 'second edit in progress'
+    Object.defineProperty(editor, 'isContentEditable', { value: true })
+    fireEvent.keyDown(editor, { key: 'z', ctrlKey: true })
+
+    // The guard returned before the switch: the stack still holds exactly the
+    // first command, and the committed text is untouched.
+    expect(useEditorStore.getState().undoStack).toHaveLength(1)
+    await waitFor(async () => {
+      expect((await blockRepo.get(first))?.translatedText).toBe('first edit')
+    })
+  })
+
+  /**
+   * Task 4.4 — overflow warning: a block whose text measures outside its box
+   * raises the toolbar badge (measured with jsdom's metric-free 0.52em
+   * fallback, so the numbers below are deterministic).
+   */
+  it('shows the overflow badge for blocks that measure outside their box', async () => {
+    const page = await pageRepo.upsert({
+      projectId: PROJECT_ID,
+      index: 0,
+      width: 612,
+      height: 792,
+    })
+    // 12pt Myanmar text wraps to 2 lines → 36pt tall inside a 10pt box.
+    const narrow = await blockRepo.upsert({
+      projectId: PROJECT_ID,
+      pageId: page.id,
+      order: 0,
+      sourceText: SOURCE,
+      translatedText: TRANSLATION,
+      x: 72,
+      y: 72,
+      width: 100,
+      height: 10,
+    })
+    // The same text fits comfortably in a 468 × 120 box.
+    await blockRepo.upsert({
+      projectId: PROJECT_ID,
+      pageId: page.id,
+      order: 1,
+      sourceText: SOURCE,
+      translatedText: TRANSLATION,
+      x: 72,
+      y: 120,
+      width: 468,
+      height: 120,
+    })
+    mount()
+    await screen.findAllByTestId('editor-block')
+
+    await waitFor(
+      () => {
+        expect(screen.getByTestId('overflow-count')).toBeInTheDocument()
+        expect(useEditorStore.getState().overflowIds).toEqual([narrow.id])
+      },
+      { timeout: 4000 },
+    )
   })
 })

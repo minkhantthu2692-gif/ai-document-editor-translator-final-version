@@ -18,6 +18,7 @@ import {
   Card,
   ConfirmDialog,
   EmptyState,
+  Input,
   Switch,
   Tabs,
   Textarea,
@@ -308,6 +309,8 @@ function BlockTab({ projectId, block }: BlockTabProps) {
         </Card>
       ) : null}
 
+      <GeometryCard block={block} />
+
       <Card title={t('editor.block.actions')}>
         <Switch
           checked={locked}
@@ -353,6 +356,131 @@ function BlockTab({ projectId, block }: BlockTabProps) {
         onCancel={() => setConfirmApply(false)}
       />
     </div>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/* Position & size card                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Manual geometry, in PDF points relative to the page. A block's box was cut
+ * from the *source* PDF; nudging it here is the pre-export equivalent of the
+ * reflow pass — the same four fields are what `collect.ts` reads back out of
+ * the row for the absolute export layout, so what this card saves is exactly
+ * what the file will print. Everything routes through `commitCommand`, so it
+ * is undoable, revisioned and auto-saved like any other edit.
+ */
+const GEOMETRY_FIELDS = [
+  { key: 'x', labelKey: 'editor.block.geomX', min: 0 },
+  { key: 'y', labelKey: 'editor.block.geomY', min: 0 },
+  { key: 'width', labelKey: 'editor.block.geomW', min: 1 },
+  { key: 'height', labelKey: 'editor.block.geomH', min: 1 },
+] as const
+
+type GeometryKey = (typeof GEOMETRY_FIELDS)[number]['key']
+
+/** Float noise from extraction round-trips should not show in the inputs. */
+function round2(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+function draftOf(block: IndexedBlock): Record<GeometryKey, string> {
+  return {
+    x: String(round2(block.x)),
+    y: String(round2(block.y)),
+    width: String(round2(block.width)),
+    height: String(round2(block.height)),
+  }
+}
+
+/** Every field must be a finite number at or above its minimum. */
+function parseGeometry(draft: Record<GeometryKey, string>): Record<GeometryKey, number> | null {
+  const out = {} as Record<GeometryKey, number>
+  for (const field of GEOMETRY_FIELDS) {
+    const value = Number(draft[field.key].trim())
+    if (!Number.isFinite(value) || value < field.min) return null
+    out[field.key] = round2(value)
+  }
+  return out
+}
+
+function GeometryCard({ block }: { block: IndexedBlock }) {
+  const { t } = useTranslation()
+  const { id, x, y, width, height } = block
+  const [draft, setDraft] = useState<Record<GeometryKey, string>>(() => draftOf(block))
+
+  // Follow the stored geometry whenever it actually changes (a reload, an
+  // undo, selecting a different block) without clobbering half-typed numbers.
+  const initial = draftOf(block)
+  useEffect(() => {
+    setDraft({
+      x: String(round2(x)),
+      y: String(round2(y)),
+      width: String(round2(width)),
+      height: String(round2(height)),
+    })
+  }, [id, x, y, width, height])
+
+  const parsed = parseGeometry(draft)
+  const touched = GEOMETRY_FIELDS.some((field) => draft[field.key] !== initial[field.key])
+  const dirty =
+    parsed !== null &&
+    GEOMETRY_FIELDS.some((field) => Math.abs(parsed[field.key] - block[field.key]) > 0.01)
+
+  function commit(): void {
+    if (parsed === null) return
+    const patch: BlockPatch = {}
+    for (const field of GEOMETRY_FIELDS) {
+      if (Math.abs(parsed[field.key] - block[field.key]) > 0.01) {
+        patch[field.key] = parsed[field.key]
+      }
+    }
+    if (Object.keys(patch).length === 0) return
+    const targets = patchTargets([block], [block.id], () => patch)
+    if (targets.length === 0) return
+    void commitCommand(commandFrom('editor.cmd.layout', 'edit-layout', targets, 'user')).catch(() =>
+      toast('warning', t('toast.failed')),
+    )
+  }
+
+  return (
+    <Card
+      title={t('editor.block.geometryTitle')}
+      actions={
+        <Button size="sm" disabled={!dirty} onClick={commit} data-testid="geom-save">
+          {t('common.save')}
+        </Button>
+      }
+    >
+      <div className="grid grid-cols-2 gap-2">
+        {GEOMETRY_FIELDS.map((field) => (
+          <Input
+            key={field.key}
+            data-testid={`geom-${field.key}`}
+            label={t(field.labelKey)}
+            type="number"
+            inputMode="decimal"
+            min={field.min}
+            step="any"
+            value={draft[field.key]}
+            onChange={(event) => setDraft({ ...draft, [field.key]: event.target.value })}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                commit()
+              }
+            }}
+          />
+        ))}
+      </div>
+      <p className="mt-2 text-xs text-muted">{t('editor.block.geometryDesc')}</p>
+      {parsed === null && touched ? (
+        <p className="mt-1 text-xs text-warning" data-testid="geom-invalid">
+          {t('editor.block.geometryInvalid')}
+        </p>
+      ) : null}
+    </Card>
   )
 }
 

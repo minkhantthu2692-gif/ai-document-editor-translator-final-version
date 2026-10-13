@@ -213,6 +213,7 @@ export type FontSizeMode = 'original' | 'auto' | 'custom'
 export type RevisionAction =
   | 'edit-text'
   | 'edit-style'
+  | 'edit-layout'
   | 'find-replace'
   | 'retranslate'
   | 'suggest'

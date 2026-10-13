@@ -140,6 +140,18 @@ extras, design language preserved.
 **Exit:** a user can edit and verify the change in the final PDF (test evidence), or the
 gap is documented with a minimal fix in this plan.
 
+**Status (2026-10-13): complete.** 4.1 answered in AUDIT §7.3 (five entry points; mount
+gate `blockCount > 0` confirmed) and pinned by `WorkspacePage.test.tsx` route tests. 4.2
+landed as the WorkspaceEditor/BlockInspector round-trip tests (collect →
+buildHtmlDocument — the boundary jsdom can run, since `runExport` needs a `Worker`)
+plus a browser edit round-trip in the harness: real UI edit → `runExport` → marker
+asserted in the print HTML *and* in the printed PDF's text layer → Ctrl+Z restores the
+original; full plan 7/7 `edit:ok`. 4.3: editor-side `status: 'edited'` assertion added,
+pairs with 2.4. 4.4 verified, not rebuilt: overflow badge, typing guard, undo/redo,
+shortcut map documented and pinned (inert Ctrl+S removed); no unsaved state exists by
+design (autosave-on-commit), `busy.autosave` key flagged for 5.x. Geometry editing added
+as numeric X/Y/W/H fields through the command stack (the position/size brief item).
+
 ## 6. Phase 05 — UI/UX polish (`PHASE-05-UI-UX.md`)
 
 **Goal:** targeted fixes only, identity preserved. **Depends on:** Phases 02-04 (controls

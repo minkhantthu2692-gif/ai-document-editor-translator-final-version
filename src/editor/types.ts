@@ -25,6 +25,11 @@ export interface BlockFields {
   suggestedModel: string | null
   suggestedAt: number | null
   overflow: boolean
+  /** Geometry in PDF points relative to the page (pre-export positioning). */
+  x: number
+  y: number
+  width: number
+  height: number
 }
 
 export type BlockFieldKey = keyof BlockFields

@@ -1012,7 +1012,14 @@
       "lockDesc": "Locking keeps this block out of re-translations and bulk edits.",
       "lockedHint": "This block is locked.",
       "confirmApplyTitle": "Overwrite the existing translation?",
-      "confirmApplyBody": "Re-translating replaces the text currently in this block. You can undo it afterwards."
+      "confirmApplyBody": "Re-translating replaces the text currently in this block. You can undo it afterwards.",
+      "geometryTitle": "Position & size",
+      "geometryDesc": "PDF points, relative to the page. Saved edits move the block in the preview and in the export.",
+      "geomX": "X",
+      "geomY": "Y",
+      "geomW": "Width",
+      "geomH": "Height",
+      "geometryInvalid": "Enter numbers — width and height must be at least 1."
     },
     "pageNumber": "Page {{number}}",
     "originalPane": "Original",
@@ -1113,6 +1120,7 @@
     "cmd": {
       "editText": "Edit text",
       "style": "Change style",
+      "layout": "Adjust position & size",
       "retranslate": "Re-translate",
       "suggest": "Suggest alternative",
       "accept": "Accept suggestion",
@@ -1155,6 +1163,7 @@
     "action": {
       "edit-text": "Edit text",
       "edit-style": "Change style",
+      "edit-layout": "Adjust position & size",
       "find-replace": "Find and replace",
       "retranslate": "Re-translate",
       "suggest": "Suggest alternative",

@@ -32,6 +32,14 @@ const WRITABLE_FIELDS = new Set<string>([
   'suggestedModel',
   'suggestedAt',
   'overflow',
+  // Geometry: the pre-export editor lets a block be nudged/resized, and the
+  // absolute export layout reads exactly these four fields back out of the
+  // row (`collect.ts` → `left/top/width`). Without them here `sanitizePatch`
+  // would silently drop a position edit before it ever reached Dexie.
+  'x',
+  'y',
+  'width',
+  'height',
 ])
 
 /** The part of a patch that is actually persisted. */

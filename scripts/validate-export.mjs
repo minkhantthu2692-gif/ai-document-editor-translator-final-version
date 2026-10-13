@@ -27,7 +27,14 @@
  *   node scripts/validate-export.mjs                 # the whole plan
  *   node scripts/validate-export.mjs table slide     # selected fixtures
  *   node scripts/validate-export.mjs --skip-print    # raster exports only
+ *   node scripts/validate-export.mjs --skip-edit     # no Phase 04 edit round-trip
  *   node scripts/validate-export.mjs --fresh         # new browser profile
+ *
+ * The Phase 04 edit round-trip (on by default, once per fixture): double-click
+ * a translated block in the real editor UI, type a marker, export through
+ * `runExport`, assert the marker in the printed HTML *and* in the text layer
+ * of the PDF Chrome prints from it, then Ctrl+Z and assert the original text
+ * is back — so the fixture is left exactly as it was.
  *
  * Requires the dev server on :5173 (started automatically when absent) and
  * Chrome (Edge fallback) on this machine.
@@ -37,7 +44,7 @@ import { existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync,
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const FIXTURE_DIR = join(ROOT, 'fixtures')
@@ -830,6 +837,318 @@ async function printHtmlToPdf(ctx, htmlPath, backTo) {
 }
 
 /**
+ * Extract a PDF's text layer — Node-side, through pdfjs' legacy build.
+ *
+ * Text extraction needs no canvas (rasterisePdf still runs in the page for
+ * that reason), and doing it in Node removes every environment variable the
+ * in-page evaluate inherits: origin after the print navigation, worker state,
+ * CMap resolution. Proven against `val-editproof-*.print.pdf` directly.
+ */
+async function pdfText(pdfPath) {
+  const pdfjs = await import(
+    pathToFileURL(join(ROOT, 'node_modules', 'pdfjs-dist', 'legacy', 'build', 'pdf.mjs')).href
+  )
+  const data = new Uint8Array(readFileSync(pdfPath))
+  const doc = await pdfjs.getDocument({ data, isEvalSupported: false }).promise
+  let out = ''
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i)
+    const content = await page.getTextContent()
+    out += content.items.map((it) => it.str).join(' ') + '\n'
+  }
+  return out
+}
+
+/**
+ * Phase 04 (task 4.2) — the edit round trip, end to end.
+ *
+ * Drives the real editor UI (dblclick → inline contentEditable → blur →
+ * command stack → Dexie), exports through the same `runExport` the dialog
+ * uses, and asserts a unique marker in (a) the printed HTML artifact and
+ * (b) the text layer of the PDF Chrome prints from it — the phase brief's
+ * "verify that it is present in the final PDF". Ctrl+Z then goes through the
+ * editor's own window handler and the original text must come back, so the
+ * fixture is left exactly as it was for later runs (a direct Dexie rewrite is
+ * the belt-and-braces fallback and is reported in `issues`).
+ *
+ * `eligible:false` (no mock-translated paragraph in scope) is a note, not a
+ * failure: it means the fixture has nothing an editor could edit.
+ */
+async function editRoundTrip(ctx, { pid, fixture, workspacePath, pages }) {
+  const { evalJs, waitFor, goto } = ctx
+  const marker = 'EDITRT-' + Math.random().toString(36).slice(2, 6).toUpperCase()
+  const out = {
+    marker,
+    eligible: false,
+    saved: false,
+    statusOk: false,
+    html: false,
+    pdf: false,
+    undo: false,
+    issues: [],
+    file: null,
+    pdfFile: null,
+    pngs: [],
+  }
+
+  // The edit and the undo must share one page session — the undo stack lives
+  // in the store, and printHtmlToPdf navigates away (which resets it).
+  const onWorkspace = await evalJs(
+    `location.pathname === ${JSON.stringify(workspacePath)}`,
+    false,
+  )
+  if (!onWorkspace) {
+    await goto(workspacePath)
+    const ready = await waitFor(
+      `!!document.querySelector('[data-testid="workspace-editor"]') &&
+        document.querySelectorAll('[data-block-id]').length > 0`,
+      60000,
+    )
+    if (!ready) {
+      out.issues.push('workspace blocks never rendered')
+      return out
+    }
+  }
+
+  // Target through the model: mock-translated paragraphs inside the pages this
+  // fixture exports, without a skip rule (skip blocks print their source text
+  // by design, and source text must never be edited). Prefer one whose row is
+  // already mounted: Virtuoso renders one row per page and only the rows near
+  // the viewport, so a later page's blocks do not exist in the DOM yet.
+  const target = await evalJs(`(async () => {
+    const { blockRepo, pageRepo } = await import('/src/db/repo-content.ts')
+    const [pages, blocks] = await Promise.all([
+      pageRepo.listByProject('${pid}'),
+      blockRepo.listByProject('${pid}'),
+    ])
+    const wanted = ${pages ? JSON.stringify(pages) : 'null'}
+    const inScope = new Set(
+      pages.filter((p) => !wanted || wanted.includes(p.index)).map((p) => p.id),
+    )
+    const pageById = new Map(pages.map((p) => [p.id, p.index]))
+    const eligible = blocks
+      .filter(
+        (b) =>
+          inScope.has(b.pageId) &&
+          b.kind === 'paragraph' &&
+          !b.skipRule &&
+          (b.status === 'translated' || b.status === 'edited') &&
+          b.translatedText.trim().length > 0,
+      )
+      .map((b) => ({
+        id: b.id,
+        text: b.translatedText,
+        status: b.status,
+        pageIndex: pageById.get(b.pageId),
+      }))
+      .sort((a, b) => a.pageIndex - b.pageIndex)
+    if (eligible.length === 0) return null
+    const rendered = new Set(
+      [...document.querySelectorAll('[data-block-id]')].map((n) => n.getAttribute('data-block-id')),
+    )
+    return eligible.find((b) => rendered.has(b.id)) ?? eligible[0]
+  })()`)
+  if (target?.__error) throw new Error('target lookup failed: ' + target.__error)
+  if (!target) {
+    out.issues.push('no mock-translated paragraph in scope')
+    return out
+  }
+  out.eligible = true
+
+  // The real gesture: the block node, a double click, a typed marker, blur.
+  // If the target's row is not mounted yet, walk the editor's inner scroller
+  // a screen at a time until Virtuoso mounts it (the row only has to exist —
+  // the synthetic double-click does not need it to be in the viewport).
+  let nodeUp = await waitFor(`!!document.querySelector('[data-block-id="${target.id}"]')`, 5000)
+  for (let step = 0; step < 16 && !nodeUp; step++) {
+    const moved = await evalJs(
+      `(() => {
+        const scroller = [...document.querySelectorAll('[data-testid="workspace-editor"] div')].find(
+          (d) =>
+            d.scrollHeight > d.clientHeight + 40 &&
+            /auto|scroll/.test(getComputedStyle(d).overflowY),
+        )
+        if (!scroller) return false
+        const atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4
+        scroller.scrollTop = atEnd ? 0 : scroller.scrollTop + scroller.clientHeight
+        return true
+      })()`,
+      false,
+    )
+    if (!moved) break
+    nodeUp = await waitFor(`!!document.querySelector('[data-block-id="${target.id}"]')`, 4000)
+  }
+  if (!nodeUp) {
+    out.issues.push(`block node never rendered (page ${target.pageIndex})`)
+    return out
+  }
+  // Capture page-side errors from the start so a silent throw in the commit
+  // path can be reported instead of guessed at.
+  await evalJs(
+    `(() => {
+      window.__rtErrors = []
+      window.addEventListener('error', (e) => window.__rtErrors.push(String(e.message)))
+      window.addEventListener('unhandledrejection', (e) =>
+        window.__rtErrors.push(String((e.reason && e.reason.stack) || e.reason)),
+      )
+      return true
+    })()`,
+    false,
+  )
+  await evalJs(
+    `(() => {
+      const node = document.querySelector('[data-block-id="${target.id}"]')
+      node.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }))
+      return true
+    })()`,
+    false,
+  )
+  const opened = await waitFor(`!!document.querySelector('[data-testid="block-editor"]')`, 10000)
+  if (!opened) {
+    out.issues.push('inline editor never opened')
+    return out
+  }
+  const typed = await evalJs(
+    `(() => {
+      const ed = document.querySelector('[data-testid="block-editor"]')
+      if (!ed) return false
+      ed.focus()
+      ed.textContent = ${JSON.stringify(marker)}
+      // React 18 binds onBlur to the native bubbling focusout event (see
+      // registerSimpleEvents in react-dom). Dispatch it directly: a synthetic
+      // focusout reaches React's root listener whether or not the headless
+      // window granted the contentEditable real focus, while ed.blur()
+      // fires nothing at all on an unfocused element.
+      ed.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+      return true
+    })()`,
+    false,
+  )
+  if (typed?.__error || !typed) {
+    out.issues.push('inline edit failed: ' + (typed?.__error ?? 'editor gone'))
+    return out
+  }
+
+  // Auto-save landed AND the command reached the undo stack: commitCommand
+  // writes Dexie before pushing, so both are polled together.
+  let state = null
+  for (let i = 0; i < 80; i++) {
+    state = await evalJs(`(async () => {
+      const [{ blockRepo }, { useEditorStore }] = await Promise.all([
+        import('/src/db/repo-content.ts'),
+        import('/src/editor/store.ts'),
+      ])
+      const r = await blockRepo.get('${target.id}')
+      return {
+        text: r ? r.translatedText : null,
+        status: r ? r.status : null,
+        undo: useEditorStore.getState().undoStack.length,
+      }
+    })()`)
+    if (state && !state.__error && state.text === marker && state.undo >= 1) break
+    await sleep(150)
+  }
+  out.saved = !!state && state.text === marker && state.undo >= 1
+  out.statusOk = out.saved && state.status === 'edited'
+  if (!out.saved) {
+    const diag = await evalJs(`(async () => {
+      const [{ useEditorStore }] = await Promise.all([import('/src/editor/store.ts')])
+      const s = useEditorStore.getState()
+      return {
+        editorOpen: !!document.querySelector('[data-testid="block-editor"]'),
+        editingId: s.editingBlockId,
+        undo: s.undoStack.length,
+        errs: window.__rtErrors || [],
+      }
+    })()`)
+    out.issues.push(
+      'commit never persisted (state=' + JSON.stringify(state) + ' diag=' + JSON.stringify(diag) + ')',
+    )
+    return out // nothing was written — nothing to restore
+  }
+  if (!out.statusOk) out.issues.push('status after edit was ' + state.status)
+
+  // Export through the real orchestration: format 'pdf' builds the print HTML.
+  let fileAbs = null
+  try {
+    const fileName = `val-editproof-${fixture}`
+    const run = await runExport(ctx, { pid, kind: 'print', fileName, pages })
+    if (!run.ok || typeof run.b64 !== 'string') {
+      out.issues.push('export failed: ' + (run.error ?? 'no bytes'))
+    } else {
+      fileAbs = join(OUT, `${fileName}.html`)
+      writeFileSync(fileAbs, Buffer.from(run.b64, 'base64'))
+      out.file = `${fileName}.html`
+      out.html = readFileSync(fileAbs, 'utf8').includes(marker)
+      if (!out.html) out.issues.push('marker missing from the print HTML')
+    }
+  } catch (e) {
+    out.issues.push('export crashed: ' + (e.message ?? e))
+  }
+
+  // Undo through the editor's own Ctrl+Z handler — before printHtmlToPdf
+  // navigates away and resets the store. Always reached once the marker is
+  // in Dexie, so a failed export can never leave the fixture dirty.
+  await evalJs(
+    `window.dispatchEvent(new KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }))`,
+    false,
+  )
+  let back = null
+  for (let i = 0; i < 80; i++) {
+    back = await evalJs(`(async () => {
+      const { blockRepo } = await import('/src/db/repo-content.ts')
+      const r = await blockRepo.get('${target.id}')
+      return r ? { text: r.translatedText, status: r.status } : null
+    })()`)
+    if (back && !back.__error && back.text === target.text) break
+    await sleep(150)
+  }
+  out.undo = !!back && back.text === target.text
+  if (!out.undo) {
+    const fixed = await evalJs(`(async () => {
+      const { blockRepo } = await import('/src/db/repo-content.ts')
+      await blockRepo.update('${target.id}', {
+        translatedText: ${JSON.stringify(target.text)},
+        status: ${JSON.stringify(target.status)},
+      })
+      return true
+    })()`)
+    if (fixed?.__error) throw new Error('restore failed: ' + fixed.__error)
+    out.issues.push('Ctrl+Z did not restore — row rewritten directly')
+  }
+
+  // Print the (already written) artifact and read its text layer back.
+  if (fileAbs) {
+    try {
+      const pdfPath = await printHtmlToPdf(ctx, fileAbs, workspacePath)
+      out.pdfFile = pdfPath.split(/[\\/]/).pop()
+      const text = await pdfText(pdfPath)
+      // pdf.js chunks a line into positioning items and pdfText joins them
+      // with a space, so the marker can arrive as "EDITRT -BFJN"; compare
+      // whitespace-insensitively (the marker itself has no whitespace).
+      const flat = text.replace(/\s+/g, '')
+      out.pdf = flat.includes(marker)
+      if (!out.pdf) {
+        const at = text.indexOf('EDITRT')
+        out.issues.push(
+          `marker missing from the printed PDF text (chars=${text.length}` +
+            (at >= 0 ? ` near=${JSON.stringify(text.slice(at, at + 24))}` : '') +
+            ')',
+        )
+      }
+      const firstWanted = pages ? Math.min(...pages) : 0
+      const pdfPage = Math.max(1, target.pageIndex - firstWanted + 1)
+      out.pngs.push(
+        ...(await rasterizePdf(ctx, pdfPath, [pdfPage], `val-editproof-${fixture}`)),
+      )
+    } catch (e) {
+      out.issues.push('print/pdf: ' + (e.message ?? e))
+    }
+  }
+  return out
+}
+
+/**
  * Rasterise a PDF through pdf.js served by the dev server (Node has no
  * canvas, headless Chrome does not display PDFs). The PDF bytes travel into
  * the page as base64 in the evaluate call — same reason as the artifact path.
@@ -1187,6 +1506,34 @@ async function main() {
             log(`  rasterize failed: ${e.message}`)
           }
         }
+
+        // Phase 04 (tasks 4.2/4.3/4.4): edit through the real editor UI,
+        // export, verify the marker survives into the printed PDF, then undo
+        // it so later runs see an unmodified document.
+        if (!flags.has('--skip-edit')) {
+          try {
+            const rt = await editRoundTrip(ctx, {
+              pid,
+              fixture,
+              workspacePath,
+              pages: entry.pages ?? null,
+            })
+            record.editRoundTrip = rt
+            record.pngs.push(...(rt.pngs ?? []))
+            log(
+              `  edit round-trip: saved=${rt.saved} status=${rt.statusOk} html=${rt.html} pdf=${rt.pdf} undo=${rt.undo}` +
+                (rt.issues.length ? ` issues=${JSON.stringify(rt.issues)}` : ''),
+            )
+            if (rt.eligible && (!rt.saved || !rt.statusOk || !rt.html || !rt.pdf || !rt.undo)) {
+              record.errors.push(
+                `edit-round-trip: saved=${rt.saved} statusOk=${rt.statusOk} html=${rt.html} pdf=${rt.pdf} undo=${rt.undo} issues=${JSON.stringify(rt.issues)}`,
+              )
+            }
+          } catch (e) {
+            record.errors.push(`edit-round-trip: ${e.message ?? e}`)
+            log(`  edit round-trip FAILED: ${e.message ?? e}`)
+          }
+        }
       } catch (e) {
         record.errors.push(String(e.message ?? e))
         log(`  FIXTURE FAILED: ${e.message ?? e}`)
@@ -1212,10 +1559,18 @@ async function main() {
   writeFileSync(join(OUT, 'summary.json'), JSON.stringify(results, null, 2))
   log('\n=== summary ===')
   for (const r of results) {
+    const rt = r.editRoundTrip
+    const edit = rt
+      ? rt.eligible
+        ? rt.saved && rt.statusOk && rt.html && rt.pdf && rt.undo
+          ? 'edit:ok '
+          : 'edit:FAIL '
+        : 'edit:n/a '
+      : ''
     log(
       `${r.fixture}: blocks=${r.blocks ?? '-'} exports=${r.exports
         .map((e) => `${e.kind}:${e.ok ? 'ok' : 'FAIL'}`)
-        .join(',')} pngs=${r.pngs.length} errors=${r.errors.length ? r.errors.join(' | ') : 'none'}`,
+        .join(',')} ${edit}pngs=${r.pngs.length} errors=${r.errors.length ? r.errors.join(' | ') : 'none'}`,
     )
   }
   log(`artifacts in ${OUT}`)

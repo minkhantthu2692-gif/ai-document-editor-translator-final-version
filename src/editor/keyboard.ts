@@ -36,7 +36,6 @@ export const EDITOR_SHORTCUTS = {
   zoomOut: { key: '-', ctrl: true },
   zoomReset: { key: '0', ctrl: true },
   export: { key: 'e', ctrl: true, shift: true },
-  save: { key: 's', ctrl: true },
   escape: { key: 'Escape' },
   nextMatch: { key: 'Enter' },
   prevMatch: { key: 'Enter', shift: true },
@@ -104,7 +103,6 @@ export function shouldPreventDefault(id: ShortcutId): boolean {
     id === 'zoomIn' ||
     id === 'zoomOut' ||
     id === 'zoomReset' ||
-    id === 'export' ||
-    id === 'save'
+    id === 'export'
   )
 }

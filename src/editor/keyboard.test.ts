@@ -58,3 +58,14 @@ describe('shouldPreventDefault', () => {
     expect(shouldPreventDefault('escape')).toBe(false)
   })
 })
+
+describe('the shortcut map', () => {
+  it('carries no unbound entries (Phase 4)', () => {
+    // `save` used to sit in this map and in shouldPreventDefault while no
+    // handler existed for it — Ctrl+S was swallowed and nothing happened.
+    // Every edit commits on its own (command stack → Dexie), so a save
+    // shortcut has nothing to do; the entry was removed rather than left
+    // looking functional.
+    expect(EDITOR_SHORTCUTS).not.toHaveProperty('save')
+  })
+})
