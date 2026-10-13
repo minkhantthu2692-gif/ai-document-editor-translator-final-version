@@ -39,3 +39,4 @@ __pycache__/
 *.pyc
 # tesseract.js drops language data in the working directory on first use
 *.traineddata
+.vercel/
