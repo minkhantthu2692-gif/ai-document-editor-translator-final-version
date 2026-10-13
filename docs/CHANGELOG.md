@@ -39,10 +39,14 @@ Phase 03 — PDF layout reconstruction, export quality and visual validation.
 - **3.4 erase blending (L-07)**: feathered per-side ring repaint — per-side ring medians
   with bilinear blending — plus `runExtent` at 0.75 em/glyph so degenerate text-run
   widths no longer collapse (L-10).
-- **3.5 layout suggestions are review-only**: the Layout pass proposes positions/fit
-  sizes but writes nothing on its own; `FIT_MIN_SIZE` pinned to 6pt on both the measure
-  and paint paths.
-- **3.6 fonts ship via `@fontsource`** packages instead of remote CDN loads.
+- **3.5 (verified and pinned)**: fit/reflow policy review — the Layout pass stays
+  review-only (it proposes positions/fit sizes and writes nothing on its own), and
+  `FIT_MIN_SIZE` = 6pt is now pinned by tests on both the measure and paint paths so no
+  later change can shrink text below the floor.
+- **3.6 (verified, no code change)**: font embedding/licensing review — the app already
+  bundles fonts locally via `@fontsource` (present since the baseline; no remote CDN
+  loads), and Myanmar shaping was checked on rendered output pages. The OFL attribution
+  note for the bundled families is still outstanding.
 
 ### Fixed
 

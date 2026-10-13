@@ -321,11 +321,17 @@ artifacts — no live provider was involved.
   black text loses contrast where the blend darkens toward a bar colour (scanned p1/p3).
 - **L-10 → fixed (3.4).** `runExtent` estimates degenerate text-run widths at 0.75 em per
   glyph instead of skipping them, so sub-pixel runs are erased too.
-- **3.5 → landed as review-only.** The Layout pass proposes positions/fit sizes and writes
-  nothing on its own; `FIT_MIN_SIZE` pinned to 6pt on both measure and paint paths.
+- **3.5 → verified and pinned.** The Layout pass stays review-only (proposes
+  positions/fit sizes, writes nothing on its own); `FIT_MIN_SIZE` = 6pt is pinned to both
+  measure and paint paths by tests (`composite.test.ts`).
 - **U-03 → closed.** The 3.7 CDP harness renders, rasterises and captures every fixture
-  export; all 10 exports / 25 PNGs were inspected (per-page results in the phase notes).
+  export; all 10 exports / 25 PNGs were inspected (acceptance table below).
   Remaining gaps are listed as limitations, not unknowns.
+- **3.6 → verified, no code change.** Font embedding/licensing review: the project
+  already bundles its fonts locally via `@fontsource` (present since the baseline, no
+  remote CDN loads), and Myanmar shaping was verified on rendered pages. The OFL
+  attribution note for the bundled families remains outstanding (tracked as a
+  limitation, not a finding).
 - **New finding (3.7 → fixed): HTML-family exports lost every per-block declaration
   after `font-family`.** The font stack quotes its family names and the block
   `style="…"` attribute was interpolated unescaped, so the parser ended the attribute at
@@ -355,6 +361,34 @@ artifacts — no live provider was involved.
   same string; blank post-erase backgrounds then composite identically. Harness
   mock-fidelity limitation only.
 
+#### 3.7 acceptance table (fixture → format → result)
+
+Artifact set: full plan on the post-fix build — 7 fixtures / 10 exports / 25 PNGs, zero
+errors (`validate-out/summary.json`; artifacts are git-ignored, this table is the durable
+record). "Inspected" means the rasterised PNG of every page of that export was opened
+and examined, not merely that the export succeeded.
+
+| Fixture | Format | Result |
+|---|---|---|
+| text-300p (300 pp, 1502 blocks, 2.5× stress block, EN→Myanmar growth) | `pdf-raster` (clamp) | ✅ inspected (p1, p2≡p4, p3) — clean; 8 blocks reported `EXPORT_LAYOUT_CLIPPED` (clamp floors at 6pt and clips at the box edge by design); stress head clamped + clipped; English skip/source-fallback lines render as designed |
+| text-300p | `pdf-raster` (adjust) | ✅ inspected (p1–p4) — clean; push-down gives the stress head room; red head preserved; p3 below-base marks verified as marks, not overlap |
+| text-300p | `pdf` (print path) | ✅ inspected (p1–p4) **after the style-escaping fix** — red bold head, per-block sizes, no overlaps; before the fix: 0 red pixels, uniform inherited size (defect, fixed) |
+| mixed (figure + red head + footers) | `pdf-raster` (clamp) | ✅ inspected (p1–p2) — clean; figure lines preserved; footers source-fallback |
+| mixed | `pdf` (print path) | ✅ inspected (p1–p2) **after the fix** — p1 repaired (was heavily overlapped); figure survives (baked pixels) |
+| scanned (injected bars, no text layer) | `pdf-raster` (clamp) | ✅ inspected (p1–p3) — erase + feathered inpaint working, injected Myanmar clean, no duplicated original glyphs; contrast caveat: glyph tops can cross above the inpainted band and black text over dark blends loses contrast (L-07 trade-off) |
+| table | `pdf-raster` | ✅ inspected (p1–p2) — clean; table grid not repainted in the raster path (tables paint as text there); faint source grid remnants on p2, non-intrusive |
+| table-spans | `pdf-raster` | ✅ inspected (p1) — clean |
+| table-continued | `pdf-raster` | ✅ inspected (p1–p2) — clean; dense p1 paragraph separated |
+| slide (landscape) | `pdf-raster` | ✅ inspected (p1) — clean; two columns do not collide |
+| EN→Myanmar growth | covered by text-300p stress block | ✅ wrapped (print) / pushed (adjust) / clipped+reported (clamp) |
+| In-app previews (7 captured) | — | 2 inspected (text-300p, mixed): translated view renders the same model, growth shows as overlap in preview because push-down happens at export with Adjust layout on; **5 (table*, slide, scanned) captured but not individually inspected** |
+| In-browser erase probe (3.7) | — | ✅ erased band under the app's own render path measures ≈173 light px vs ≈20 on the un-erased control — 3.1+3.4 confirmed working in-page |
+
+Honest caveats: identical text-300p pages 2/4 are a mock-translator artifact (above);
+no stored block carried `overflow: true`, so no red dashed flags were expected anywhere
+(flag machinery unit-tested); print exports keep the source page image as background by
+design, so page-image artifacts remain visible there.
+
 ## 8. Findings — Unknown (need credentials / browser / data)
 
 - **U-01** Real provider rate-limit, quota and header behaviour per model. The harness
@@ -364,7 +398,7 @@ artifacts — no live provider was involved.
   before/after numbers recorded).
 - **U-03** ~~Rendered-page visual inspection of exported PDFs~~ — **closed in Phase 03
   (3.7)**: the CDP harness renders every fixture export to PNGs and they were inspected
-  (see §7.2 and the phase notes).
+  (acceptance table in §7.2).
 - **U-04** OCR quality and sidecar parity on real scans (offline parity tests pass:
   `src/sidecar/extractParity.test.ts`).
 - **U-05** Whether each adapter's reported `tokensIn` includes chat-template overhead —
@@ -443,11 +477,13 @@ re-run, in isolation, and in both subsequent full runs — untouched file, unrel
 phase. Secret-pattern scan of `src/` + phase documents: 0 matches. Remaining provider-side
 items (U-01, U-05) need live keys. Phase 03 (PDF export) may proceed.
 
-Phase 03 (2026-10-13) is complete: tasks 3.1-3.7 landed as seven scoped commits —
+Phase 03 (2026-10-13) is complete: tasks 3.1-3.5 and 3.7 landed as six scoped commits —
 erase planning (C-02/L-01), clamp/reporting semantics (C-03/L-02), worker font
 registration (L-03, closes C-04), feathered per-side repaint (L-07) and degenerate-run
-erasing (L-10), review-only layout suggestions with the 6pt floor pinned, @fontsource
-fonts, and the CDP visual-validation harness. The harness found and closed a
+erasing (L-10), review-only layout suggestions with the 6pt floor pinned, font
+bundling/licensing verified (3.6 — fonts already ship via `@fontsource` since the
+baseline, so no code change; OFL note outstanding), and the CDP visual-validation
+harness. The harness found and closed a
 pre-existing export defect: HTML-family exports (html/pdf/bilingual-pdf/print) dropped
 every per-block declaration after `font-family` because the quoted font stack broke the
 `style` attribute — fixed with one escaping change plus a regression test (§7.2).
