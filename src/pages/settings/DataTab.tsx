@@ -3,8 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { Button, Card, ConfirmDialog, Select } from '@/components/ui'
 import { settingsRepo } from '@/db/repo-settings'
 import { downloadBackup, restoreBackupFromFile } from '@/db/backup'
-import { deleteDatabase } from '@/db/db'
-import { destroyDeviceSecret } from '@/core/crypto'
+import { resetEverything } from '@/db/db'
 import { logEvent } from '@/core/eventLogger'
 import { toast } from '@/stores/toastStore'
 import { useUiStore } from '@/stores/uiStore'
@@ -90,10 +89,13 @@ export function DataTab() {
   async function deleteEverything() {
     setBusy(true)
     try {
-      destroyDeviceSecret()
-      await deleteDatabase()
+      // "All local data" includes the localStorage keys (`aidt.ui`,
+      // `aidt.deviceId`) — `resetEverything` clears those too, so the app is
+      // back in its fresh-install state. Landing on /welcome shows that
+      // directly instead of reloading this (now empty) settings page.
+      await resetEverything()
       toast('success', t('settings.data.deleted'))
-      window.setTimeout(() => window.location.reload(), 350)
+      window.setTimeout(() => window.location.replace('/welcome'), 350)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       toast('danger', t('toast.failed'), message)

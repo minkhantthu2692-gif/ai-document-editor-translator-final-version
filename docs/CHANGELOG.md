@@ -8,6 +8,48 @@ cut — everything under `Unreleased` is work in progress on `main`.
 
 ## [Unreleased]
 
+**Follow-up round** — three user reports after release: the landing/first-time-setup screen
+not being visible, "Delete all local data" refreshing into the settings page, and the
+pre-export editor not being discoverable from the translation page.
+
+### Fixed
+
+- **"Delete all local data" returns the app to the landing screen**
+  (`src/pages/settings/DataTab.tsx`): the Data-tab wipe deleted only the Dexie database and
+  then reloaded the current URL, so `aidt.ui` (localStorage — `onboarded`, theme, language)
+  survived and a reload dropped the user back onto the settings page of an emptied app.
+  The wipe now runs `resetEverything()` — the same storage half as the Cache tab's factory
+  reset (database, device secret, device id, `aidt.ui`) — and navigates to `/welcome`, which
+  renders the welcome/setup screen exactly like a fresh install.
+- **Factory reset from the Cache tab lands on the welcome screen too**
+  (`src/pages/settings/CacheTab.tsx`): it cleared the right storage but reloaded `/settings`
+  in place, showing an empty settings page instead of the welcome screen its own comment
+  promised. Same `/welcome` hand-off now.
+
+### Added
+
+- **Visible "Open editor" entry on the translation page** (`src/pages/TranslatePage.tsx`):
+  the pre-export editor lives in the workspace, but the translate page only offered a ghost
+  "Back to workspace" button that never mentioned it, so the editor looked missing. The
+  header now carries a labelled secondary button (edit icon, `data-testid
+  translate-open-editor`) linking to `/workspace/:projectId`, where the editor card renders
+  once the document has blocks. New key `translate.openEditor` in both locales; the orphaned
+  `translate.backToWorkspace` was removed.
+- **First-run/wipe regression coverage**: `src/App.test.tsx` pins the fresh-profile route
+  (`/` → `/welcome`, and the already-onboarded bounce), `src/pages/settings/DataTab.test.tsx`
+  pins that the wipe clears the localStorage first-run keys, and `TranslatePage.test.tsx`
+  pins the editor entry. `scripts/smoke.mjs` gained four real-browser checks: the fresh
+  profile shows the landing screen, the translate page's Open editor entry is visible and
+  links to `/workspace/:id`, and the delete-all flow ends at `/welcome` with first-run
+  state restored (`aidt.ui` cleared).
+
+### Notes
+
+- The welcome/setup screen was never missing: a fresh profile shows it (verified over CDP,
+  and now asserted in smoke). It is skipped only because the browser profile already
+  completed onboarding — the same `aidt.ui` key the old wipe failed to clear. After the fix,
+  Settings → Data → "Delete all local data?" returns to it directly.
+
 Phase 06 — full regression, production build & release readiness.
 
 ### Fixed

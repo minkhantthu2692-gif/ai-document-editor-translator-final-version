@@ -1,12 +1,15 @@
 /**
  * Smoke test — drives the running dev server in headless Chrome over CDP.
- * Verifies: routes render, responsive breakpoints, theme + language persistence,
+ * Verifies: the first-run landing/setup screen on a fresh profile, routes
+ * render, responsive breakpoints, theme + language persistence,
  * the PDF wizard (scanned flagging, password prompt + retry, 300-page analysis),
  * workspace thumbnails + layout extraction, Dexie data surviving reload, a
  * UI-level backup export/import round-trip, the editor/export/knowledge flows,
  * and Phase 5: sync controls + testids, the troubleshooting assistant dialog
  * (offline rule answer with safe actions), the tooling files, `.env` hygiene
  * and `tools/launcher.html` rendering from `file://`.
+ * Finally: Settings → Delete all local data must return the app to the
+ * welcome screen with first-run state restored.
  *
  * Requires: `npm run dev` on :5173 and `fixtures/` (see scripts/make-fixtures.mjs).
  */
@@ -158,6 +161,28 @@ try {
     })
     await sleep(250)
   }
+
+  // 0) First run: the landing + first-time setup screen takes over `/` -----
+  // A brand-new browser profile must land here before the app opens up;
+  // the routes below then run as an onboarded app (goto dismisses it).
+  await send('Page.navigate', { url: BASE + '/' })
+  let sawWelcome = false
+  for (let i = 0; i < 60 && !sawWelcome; i++) {
+    sawWelcome = Boolean(
+      await evalJs(`!!document.querySelector('[data-testid="welcome-get-started"]')`),
+    )
+    if (!sawWelcome) await sleep(100)
+  }
+  const welcomeHeadline = await evalJs(
+    `document.body.innerText.includes('Turn any PDF into a translated document')`,
+  )
+  check(
+    'first run: landing + first-time setup screen at /',
+    sawWelcome === true && welcomeHeadline === true,
+    `welcome=${sawWelcome} headline=${welcomeHeadline}`,
+  )
+  await evalJs(`document.querySelector('[data-testid="welcome-get-started"]')?.click()`)
+  await sleep(500)
 
   // 1) All routes render real content -------------------------------------
   const routes = [
@@ -811,6 +836,21 @@ try {
     20000,
   )
   check('translate page renders status + progress panels', translateUi)
+
+  // The pre-export editor lives in the workspace; the translate page must
+  // advertise it with a visible, labelled entry (it used to be a ghost
+  // "Back to workspace" button that never mentioned the editor).
+  const editorEntry = await evalJs(
+    `(() => { const b = document.querySelector('[data-testid="translate-open-editor"]'); if (!b) return null; const a = b.closest('a'); const r = b.getBoundingClientRect(); const cs = getComputedStyle(b); return { text: (b.textContent || '').trim(), href: a ? a.getAttribute('href') : null, w: Math.round(r.width), h: Math.round(r.height), visible: cs.visibility !== 'hidden' && cs.display !== 'none' && r.width > 0 && r.height > 0 } })()`,
+  )
+  check(
+    'translate page exposes a visible Open editor entry',
+    Boolean(editorEntry) &&
+      editorEntry.visible === true &&
+      /\/workspace\//.test(String(editorEntry.href)) &&
+      String(editorEntry.text || '').length > 0,
+    JSON.stringify(editorEntry),
+  )
 
   const controls = await evalJs(
     `['provider-select','model-select','source-language','target-language','quality-select','scope-select'].filter(id => !!document.querySelector('[data-testid="' + id + '"]')).length`,
@@ -1742,6 +1782,47 @@ try {
     'no console/runtime errors',
     realErrors.length === 0,
     realErrors.slice(0, 5).join(' | ') || 'clean',
+  )
+
+  // 12) Delete all local data → back to the welcome screen -----------------
+  // Deliberately last: the wipe erases everything the run just created. The
+  // UI is in Myanmar by now (section 4), so the dialog's confirm button is
+  // found by position (footer: cancel, confirm), never by label.
+  await goto('/settings?tab=data')
+  await evalJs(`document.querySelector('[data-testid="delete-local"]')?.click()`)
+  await sleep(400)
+  const wiped = await evalJs(
+    `(() => { const btns = [...document.querySelectorAll('[role="dialog"] footer button')]; const btn = btns[btns.length - 1]; if (!btn) return false; btn.click(); return true })()`,
+  )
+  let wipePath = ''
+  let wipeWelcome = false
+  let wipeUi = null
+  for (let i = 0; i < 60; i += 1) {
+    await sleep(100)
+    const s = await evalJs(
+      `JSON.stringify({ p: location.pathname, w: !!document.querySelector('[data-testid="welcome-get-started"]'), ui: localStorage.getItem('aidt.ui') })`,
+    )
+    const parsed = typeof s === 'string' ? JSON.parse(s) : s
+    wipePath = parsed?.p ?? ''
+    wipeWelcome = Boolean(parsed?.w)
+    wipeUi = parsed?.ui ?? null
+    if (wipePath === '/welcome' && wipeWelcome) break
+  }
+  check(
+    'delete-all: returns to the welcome screen',
+    wiped === true && wipePath === '/welcome' && wipeWelcome === true,
+    `confirm=${wiped} path=${wipePath} welcomeScreen=${wipeWelcome}`,
+  )
+  let onboardedAfter = null
+  try {
+    onboardedAfter = wipeUi ? Boolean(JSON.parse(wipeUi)?.state?.onboarded) : null
+  } catch {
+    onboardedAfter = null
+  }
+  check(
+    'delete-all: first-run state restored (no longer onboarded)',
+    onboardedAfter !== true,
+    `aidt.ui=${wipeUi ?? 'absent'}`,
   )
 } catch (e) {
   check('smoke test executed', false, e.stack || e.message)

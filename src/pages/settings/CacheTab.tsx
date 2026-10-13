@@ -100,8 +100,9 @@ export function CacheTab() {
   /**
    * Factory reset. Guarded twice over — a danger-zone button *and* a typed
    * RESET phrase — because this erases every project, key and preference the
-   * browser holds, with no undo. The reload re-seeds the defaults, so the
-   * next visit is the welcome screen of a fresh install.
+   * browser holds, with no undo. The defaults re-seed on boot, so the app
+   * returns to the welcome screen of a fresh install rather than reloading
+   * this (now empty) settings page.
    */
   async function resetApp() {
     setBusy(true)
@@ -116,7 +117,7 @@ export function CacheTab() {
         messageEn: 'Factory reset: the app returned to its fresh-install state',
       })
       toast('success', t('settings.cache.resetDone'))
-      window.setTimeout(() => window.location.reload(), 350)
+      window.setTimeout(() => window.location.replace('/welcome'), 350)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setBusy(false)

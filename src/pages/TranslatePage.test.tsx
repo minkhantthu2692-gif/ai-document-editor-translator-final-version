@@ -139,3 +139,38 @@ describe('TranslatePage run guard', () => {
     await waitFor(() => expect(startTranslate).toHaveBeenCalledTimes(2))
   })
 })
+
+describe('TranslatePage editor entry', () => {
+  let db: AppDatabase
+
+  beforeEach(async () => {
+    vi.mocked(startTranslate).mockReset()
+    db = new AppDatabase(
+      `aidt-translatepage-editor-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    )
+    setDb(db)
+    await db.open()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it('offers a visible editor entry that links to the workspace editor', async () => {
+    const project = await projectRepo.create({
+      name: 'Editor entry',
+      sourceLang: 'en',
+      targetLang: 'my',
+    })
+
+    renderAt(`/translate/${project.id}`)
+
+    // The pre-export editor lives in the workspace; from this page its entry
+    // point must be a labelled, visible control — not a ghost button that
+    // never mentions the editor.
+    const button = await screen.findByTestId('translate-open-editor', {}, { timeout: 4000 })
+    expect(button).toBeVisible()
+    expect(button).toHaveTextContent(String(i18n.t('translate.openEditor')))
+    expect(button.closest('a')?.getAttribute('href')).toBe(`/workspace/${project.id}`)
+  })
+})

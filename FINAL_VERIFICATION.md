@@ -27,6 +27,7 @@ and §4's live half is a documented blocker, not a pass.
 | 04 — Editor | X/Y/W/H geometry editing through the command stack; browser edit round-trip proof (save → status → HTML → printed PDF → Ctrl+Z); inert `Ctrl+S` shortcut removed |
 | 05 — UI/UX | `/workspace` dead-end (L-09/C-11); double-start in-flight guard (L-08); tofu in mixed-script UI strings; understated Logs total; wrong helper copy; vestigial `editor.busy.autosave`; `ProjectsPage` bulk-delete flake |
 | **06 — regression** | **Raster export could paint *zero* lines for a block** — the Phase 03 clamp (`3c9c2fa`) tested the first line too, so a box stored at its glyph height (a running header/footer is `h: 9`) lost the block entirely while HTML/print/adjust still printed it. The clamp now applies only after the first line has painted; the rest are still cut and still reported. Test: `composite.test.ts › never paints zero lines…` |
+| **Post-release follow-up** (3 user reports) | **"Delete all local data" reloaded the settings page of an emptied app** — it deleted only the Dexie database, leaving `aidt.ui` (`onboarded`, theme, language) in localStorage behind; the wipe now runs `resetEverything()` and lands on `/welcome` (the Cache-tab factory reset gets the same hand-off instead of reloading `/settings` in place). The translate page advertised the editor only through a ghost "Back to workspace" button — now a labelled **"Open editor"** button to `/workspace/:projectId`. The landing/first-time-setup screen was never missing (fresh profile → `/welcome`, verified over CDP and asserted in smoke): it is skipped once the profile has onboarded, which the old wipe never undid |
 
 ---
 
@@ -36,16 +37,17 @@ and §4's live half is a documented blocker, not a pass.
 |---|---|
 | `npm run typecheck` | ✅ exit 0 |
 | `npm run lint` | ✅ exit 0 |
-| `npx vitest run` | ✅ **1640 passed / 6 skipped**, 109 files passed + 1 skipped (110) — exit 0 |
+| `npx vitest run` | ✅ **1644 passed / 6 skipped**, 111 files passed + 1 skipped (112) — exit 0 |
 | `npm run build` | ✅ exit 0 (29.6 s); `dist/` complete: `index.html`, `assets/`, `sw.js`, `pdfjs-assets/`, manifest, icons |
-| `npm run smoke` | ✅ **161/161 passed**, `no console/runtime errors :: clean` (routes, breakpoints, theme/language persistence, PDF wizard, Dexie persistence across reload, backup export/import, editor find/replace, export + format menu, knowledge tabs, sync controls, assistant offline answers, `tools/launcher.html`, `.env` hygiene, model list) |
+| `npm run smoke` | ✅ **165/165 passed**, `no console/runtime errors :: clean` (first-run landing screen on a fresh profile, routes, breakpoints, theme/language persistence, PDF wizard, Dexie persistence across reload, backup export/import, translate page's visible Open editor entry, editor find/replace, export + format menu, knowledge tabs, sync controls, assistant offline answers, `tools/launcher.html`, `.env` hygiene, model list, delete-all → welcome screen) |
 | `node scripts/validate-export.mjs` (full plan) | ✅ 7 fixtures / 10 exports / every `edit:ok` / `errors=none` |
 | Secret-pattern scan (tracked diff + whole tree) | ✅ 0 matches for real key shapes; only `.env.example` files are tracked, `.env` is git-ignored |
 | Debug-leftover scan (`console.log`, `debugger`, `TODO`, `.only`) | ✅ 0 added (4 pre-existing `console.error/warn` on error paths) |
 | `npx vitest run src/verify/liveRun.test.ts` | ⛔ **not run** — env-gated on `VERIFY_LIVE=1` + real `OR_KEY*`/`GROQ_KEY*`; skipped by design |
 
 Test counts by phase: 1554 (baseline) → 1571 (02) → 1626 (03) → 1635 (04) → 1639 (05) →
-**1640 (06)**. The 6 skipped tests are always the env-gated live suite.
+1640 (06) → **1644 (post-release follow-up: 2 App routing, 1 DataTab wipe, 1 TranslatePage
+editor entry)**. The 6 skipped tests are always the env-gated live suite.
 
 ---
 
@@ -157,3 +159,6 @@ These cannot be done without your accounts/keys:
    then `npx vitest run src/verify/liveRun.test.ts`.
 5. **Proof-read one exported Myanmar PDF** at 100 % zoom — legibility is a visual judgement.
 6. **Licence pass** for the bundled fonts before any commercial distribution.
+7. **See the landing/first-time setup screen**: Settings → Data → "Delete all local data?"
+   now returns to `/welcome` (smoke asserts it end to end). It is otherwise only shown on a
+   fresh browser profile — once a profile has completed setup, `aidt.ui` skips it by design.

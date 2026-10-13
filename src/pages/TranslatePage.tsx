@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { useLiveQuery } from 'dexie-react-hooks'
 import { Badge, Button, Card, Progress, Select, StatusPanel, Switch } from '@/components/ui'
 import { PageContainer, PageHeader, PageLayout } from '@/components/layout/Page'
-import { IconDownload } from '@/components/layout/icons'
+import { IconDownload, IconEdit } from '@/components/layout/icons'
 import { ExportDialog } from '@/pages/workspace/ExportDialog'
 import { detectLanguage } from '@/core/langDetect'
 import type { FsmState } from '@/core/fsm'
@@ -622,9 +622,17 @@ export function TranslatePage() {
         meta={<Badge tone={phase === 'failed' ? 'danger' : 'primary'}>{phaseLabel}</Badge>}
         actions={
           <div className="flex flex-wrap items-center justify-end gap-2">
+            {/* The pre-export editor lives in the workspace — this is its
+                visible entry point from a page that otherwise only offers
+                start/pause/export. */}
             <Link to={`/workspace/${projectId}`}>
-              <Button variant="ghost" size="sm">
-                {t('translate.backToWorkspace')}
+              <Button
+                variant="secondary"
+                size="sm"
+                iconLeft={<IconEdit className="h-4 w-4" />}
+                data-testid="translate-open-editor"
+              >
+                {t('translate.openEditor')}
               </Button>
             </Link>
             {/* Exporting is the step *after* translation, so it lives in the

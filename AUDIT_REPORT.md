@@ -757,3 +757,29 @@ scaling). Live-provider verification (U-01/U-05, before/after API metrics agains
 provider) remains blocked — no keys in this environment, `VERIFY_LIVE=1` suite skipped —
 as does the OFL note for the bundled fonts. Ready for push and real-user testing with the
 limitations in `FINAL_VERIFICATION.md`.
+
+Post-release follow-up (2026-10-13, three user reports) is complete. Diagnosis came before
+any edit: the landing/first-time-setup screen was **not** missing — a fresh profile lands on
+`/welcome` with the setup screen rendered (verified over CDP: testid + headline present) and
+only an already-onboarded profile skips it (`aidt.ui` in localStorage). The other two
+reports shared the root cause: the Data tab's "Delete all local data?" deleted only the
+Dexie database and reloaded the current URL, so `aidt.ui` survived (the app stayed
+onboarded) and the reload dropped the user on the settings page of an emptied app — verified
+before the fix (`path=/settings?tab=data`, `aidt.ui` still `onboarded:true`). The editor was
+present in the workspace all along; the translate page advertised it only through a ghost
+"Back to workspace" button that never mentioned it. Fixes: the Data wipe now runs
+`resetEverything()` (database + device secret + device id + `aidt.ui`) and navigates to
+`/welcome`, the Cache-tab factory reset gets the same hand-off instead of reloading
+`/settings` in place, and the translate page carries a labelled "Open editor" button
+(`translate.openEditor`, both locales) to `/workspace/:projectId`. Coverage: `App.test.tsx`
+pins `/` → `/welcome` on a fresh profile and the already-onboarded bounce;
+`DataTab.test.tsx` pins that the wipe clears the localStorage first-run keys (the redirect
+itself is unobservable in jsdom — `location.replace` is unforgeable — so it is asserted in
+smoke instead); a `TranslatePage` test pins the editor entry; `scripts/smoke.mjs` gained
+four real-browser checks (fresh profile shows the landing screen, the translate page's
+Open editor entry is visible and links to `/workspace/:id`, delete-all ends at
+`/welcome`, first-run state restored). Final gates: `typecheck` ✅, `lint` ✅, full suite ✅
+1644 passed / 6 skipped (111/112 files; +4 tests), `npm run build` ✅ (29.7 s),
+`npm run smoke` ✅ **165/165** with a clean console. Export-affecting code was untouched and
+smoke's export checks still pass, so the full export harness was not re-run (Phase 04/06
+evidence stands). Live-provider items (U-01/U-05) and the OFL note remain blocked as before.
