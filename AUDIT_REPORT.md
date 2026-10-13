@@ -555,6 +555,55 @@ total), `src/i18n/locales/{en,my}.json` (helper copy, `busy.autosave` removal),
 No export-affecting code changed in this phase, so the CDP export harness was not
 re-run; the Phase 04 evidence (7/7 fixtures `edit:ok`, §7.3) stands.
 
+### 7.5 Phase 06 resolutions (2026-10-13)
+
+- **Raster export dropped whole blocks → fixed (regression from Phase 03).** Visual
+  inspection of the harness PNGs found that `val-text-300p-raster-p1.png` had **zero ink**
+  in band 0 (the running header) and band 18 (the footer), while `adjust` and `print`
+  rendered both *from the same export document* (adjust band 0 = 401 / band 18 = 103, print
+  band 0 = 113 / band 18 = 45). Page 3 lost its header/footer the same way.
+  Root cause: `3c9c2fa` (Phase 03/3.2) added the clamp in `drawBlock`, which cuts a line
+  when `block.y*scale + (index+1)*step > boxBottom + 1`. `step` is the line *advance*
+  (`fontSize × lineHeight × scale`) but `block.height` for a single-line run is the *glyph*
+  height — the stored header is `x:72 y:13 w:139.03 h:9`. At the 6 pt floor the advance is
+  `6 × 1.7 = 10.2 pt`, which exceeds `9 pt + 1/scale`, so the test held for `index = 0`
+  too and the block painted **nothing**. That is why only the plain raster path lost them:
+  the baseline had no clamp (it painted these blocks), and `adjustLayout`/HTML disable it.
+  Fix: the clamp now applies only *after* the first line has painted — a block may never
+  paint zero lines. The first line lands (past the box if that is the only place it fits);
+  the lines after it are still cut and still reported through `onClipped`, so C-03's
+  reporting contract is unchanged. Deliberate trade-off: in a box too short for one line
+  the first line may now touch the block below, which is chosen over silently losing the
+  block — the HTML path already prints that line.
+  Evidence: new test `never paints zero lines…` uses the real header geometry and **fails
+  on the pre-fix code** (verified by stashing `composite.ts`: 1 failed / 24 passed) and
+  passes after; harness re-run 7/7 fixtures `errors=none`; `val-text-300p-raster.pdf`
+  636,664 → 661,901 bytes; p1 ink bands 0/18 `0 → 401` and `0 → 103`, now identical to
+  adjust; crops show the red running header and the footer with correctly shaped Myanmar.
+- **"Pages 2 and 4 export byte-identically" → not a defect (synthetic-translation
+  artifact).** SHA-256 showed `val-text-300p-raster-p2.png` == `p4.png` (and the adjust
+  pair), which looked like page duplication. The stored model says otherwise: `pageTexts`
+  reports pages 3/4/5 sharing `ttHash 562ad164` / `ttLen 1994` while their `srcHash`
+  differs — the harness's mock builds `translatedText` as a function of source *length*
+  from a fixed Myanmar sentence list, so different pages of the same length receive
+  identical translations. The source pages differ (text extracted: p2 starts "Employee
+  satisfaction…", p4 "The training programme…"), the print export renders them distinctly
+  (different PNG hashes), and the raster PDF holds a distinct image object per page
+  (`img_p0_1 … img_p3_1`). No product defect; recorded so the next reader does not chase it.
+- **Method note — "blank page" readings are display artifacts.** Whole-page previews of
+  sparse pages look empty at display scale and the image viewer even drew a blue rectangle
+  that is not in the file (0 blue pixels on sampling). Every visual claim in this phase is
+  therefore backed by a pixel ink profile (20 vertical bands) plus a 3–4× crop of the
+  exact region, not by the thumbnail.
+
+Commands run this phase: `npm run typecheck` ✅ (exit 0), `npm run lint` ✅ (exit 0),
+`npx vitest run` ✅ 1640 passed / 6 skipped (109 files + 1 env-gated skipped; +1 for the
+new clamp test), `npm run build` ✅ (exit 0, 29.6 s), `node scripts/validate-export.mjs`
+✅ 7 fixtures / 10 exports / `edit:ok` / `errors=none`.
+
+Changed files: `src/export/composite.ts` (clamp guarantee), `src/export/composite.test.ts`
+(regression test).
+
 ## 8. Findings — Unknown (need credentials / browser / data)
 
 - **U-01** Real provider rate-limit, quota and header behaviour per model. The harness
@@ -675,3 +724,36 @@ green in the same runs. Final gates: `typecheck` ✅, `lint` ✅, full suite ✅
 passed / 6 skipped (108/109 files; the 1 skipped file remains the env-gated
 `VERIFY_LIVE=1` suite). Provider-side items (U-01, U-05) and the OFL note remain
 outstanding and are unchanged by this phase. Phase 05 (UI/UX polish) may proceed.
+
+Phase 05 (2026-10-13) is complete: tasks 5.1-5.5, targeted fixes with identity preserved.
+L-09/C-11 (bare `/workspace` dead-end) and L-08 (double-start) are closed with route and
+component tests; the audit surfaced and fixed three real defects — mixed-script UI strings
+rendering as tofu (`--font-sans` had no Myanmar family), a Logs total that understated
+itself, and helper copy describing a pane layout that only holds at low zoom — plus the
+vestigial `editor.busy.autosave` key and the recurring `ProjectsPage` bulk-delete flake.
+Evidence: CDP audit of 8 routes × 4 viewports (one scroll region everywhere, no horizontal
+overflow in 32/32, no console exceptions) and a browser tab-crawl (skip link first, 2 px
+focus ring on 12/12 stops); full-page thumbnails were cross-checked with pixel ink
+profiles and 3-4× crops so loading skeletons were not mistaken for blank pages. Final
+gates: `typecheck` ✅, `lint` ✅, full suite ✅ 1639 passed / 6 skipped (109/110 files; the
+1 skipped file remains the env-gated `VERIFY_LIVE=1` suite; +4 tests over Phase 04).
+Export-affecting code was untouched, so the harness was not re-run and Phase 04's evidence
+stood. Phase 06 (regression + release readiness) may proceed.
+
+Phase 06 (2026-10-13) is complete: full regression, production build and release
+readiness. Gates: `typecheck` ✅, `lint` ✅, full suite ✅ 1640 passed / 6 skipped
+(109/110 files; +1 clamp test), `npm run build` ✅ (29.6 s), `npm run smoke` ✅ 161/161
+with a clean console (routes, responsive breakpoints, theme/language persistence, PDF
+wizard, Dexie persistence, backup round-trip, editor find/replace, export, knowledge,
+sync controls, assistant, tooling, `.env` hygiene). Full export harness ✅ 7/7 fixtures /
+10 exports / `edit:ok` / `errors=none`, and every fixture's PNGs were inspected by pixel
+ink profile rather than by thumbnail. That inspection found a **regression introduced in
+Phase 03**: the raster clamp could drop a block's first line and paint the whole block
+from the sheet (running header and footer gone on `text-300p`), fixed by guaranteeing at
+least one painted line and pinned by a test that fails on the old code (§7.5). Two
+suspicious artifacts were run to ground and are *not* defects: byte-identical export pages
+(traces to the mock translator writing length-derived text) and "blank" pages (display
+scaling). Live-provider verification (U-01/U-05, before/after API metrics against a real
+provider) remains blocked — no keys in this environment, `VERIFY_LIVE=1` suite skipped —
+as does the OFL note for the bundled fonts. Ready for push and real-user testing with the
+limitations in `FINAL_VERIFICATION.md`.

@@ -8,6 +8,29 @@ cut — everything under `Unreleased` is work in progress on `main`.
 
 ## [Unreleased]
 
+Phase 06 — full regression, production build & release readiness.
+
+### Fixed
+
+- **Raster export no longer drops whole blocks** (`src/export/composite.ts`): the clamp
+  Phase 03 added to keep a block's text inside its source box tested the first line too.
+  A box stored at its glyph height — a running header/footer is `h: 9` — is shorter than
+  one line advance at the 6 pt floor (`6 × 1.7 = 10.2`), so the condition held for
+  `index = 0`, every line was cut and the block painted **nothing**, while the HTML/print
+  and adjust paths still printed it (found by inspecting the harness PNGs: band 0 and
+  band 18 of `val-text-300p-raster-p1.png` had zero ink). The clamp now applies only after
+  the first line has painted: a block always prints at least one line, the rest are still
+  cut and still reported through `onClipped`, so C-03's reporting contract is unchanged.
+  Trade-off: in a box too short for a single line, that line may now touch the block
+  below — chosen over silently losing the block. Regression test uses the real header
+  geometry and fails on the pre-fix code.
+
+### Added
+
+- **`FINAL_VERIFICATION.md`** — release report: what was fixed, the commands actually run
+  with their results, the PDF fixtures rendered and inspected, known limitations, and the
+  setup steps for hosting.
+
 Phase 05 — UI/UX polish: targeted fixes, identity preserved.
 
 ### Added

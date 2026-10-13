@@ -201,6 +201,22 @@ export-affecting code changed, so the Phase 04 harness evidence stands.
 Guardrails: never mark unrun tests as passed; never claim visual correctness from a green
 build; document any feature removed for tests.
 
+**Status (2026-10-13): complete.** All commands run and recorded (task 1): `typecheck` ✅
+exit 0, `lint` ✅ exit 0, full suite ✅ 1640 passed / 6 skipped (109/110 files; +1 test),
+`build` ✅ 29.6 s, `smoke` ✅ 161/161 with a clean console. Task 2 was done by pixel ink
+profile + 3-4× crops of every fixture's PNGs rather than thumbnails, and it caught a real
+regression from Phase 03: the raster clamp could drop a block's first line and paint the
+whole block from the sheet (running header/footer gone on `text-300p`, band 0 and band 18
+had zero ink). Fixed by guaranteeing one painted line, pinned by a test that fails on the
+old code (§7.5 of `AUDIT_REPORT.md`); harness re-run 7/7 `errors=none`. Two suspicious
+artifacts were run to ground and are not defects: byte-identical pages (the mock translator
+derives text from source length) and "blank" pages (display scaling). Task 3 (diff review):
+0 secret-shaped strings, 0 debug leftovers, 0 dead exports, only phase-scoped files. Task
+4: `CHANGELOG.md`, `AUDIT_REPORT.md` (§7.5, §12) and this file updated; `docs/DEPLOYMENT.md`
+already covers hosting. Task 5: `FINAL_VERIFICATION.md` created. Deployment: `origin`
+configured and `master` pushed. Blockers unchanged — live-provider runs (U-01/U-05) and the
+OFL font note need keys/licence work outside this environment.
+
 ## 8. Cross-phase test & measurement matrix
 
 | Concern | Tooling already present | Gap to fill |

@@ -65,3 +65,6 @@ Relevant checks pass or have clearly documented blockers; major workflows are ve
 
 ## Final Response Required
 Provide a concise release report, test results, key before/after measurements, PDF visual validation status, unresolved issues, and whether the project is ready for real-user testing.
+
+## push to this empty github reposity to host and public sharing by github and vercel.
+https://github.com/minkhantthu2692-gif/ai-document-editor-translator-final-version.git

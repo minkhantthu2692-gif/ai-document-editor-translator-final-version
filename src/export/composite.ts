@@ -113,18 +113,28 @@ function drawBlock(
   // does not fit. With `adjustLayout` on there is no clamp: the reflow has
   // made room for every line, and cutting here would delete exactly the text
   // the push was for.
+  //
+  // The one thing the clamp may never do is paint *zero* lines. A box stored
+  // at its glyph height (a running header/footer sits at h = 9pt) is shorter
+  // than one line advance at the floor — 6 × 1.7 = 10.2pt — so the naive test
+  // failed for `index = 0` too and the whole block vanished from the sheet
+  // while the HTML export printed it. Losing the block is the worse failure:
+  // the first line always lands, past the box if that is the only place it
+  // fits, and only the lines after it are cut.
   const clamp = options.adjustLayout !== true
   const boxBottom = (block.y + block.height) * scale
   let dropped = false
+  let painted = 0
 
   lines.forEach((line, index) => {
     const value = index === 0 ? `${listPrefix(block, line)}${line}` : line
     if (value.length === 0) return
-    if (clamp && block.y * scale + (index + 1) * step > boxBottom + 1) {
+    if (clamp && painted > 0 && block.y * scale + (index + 1) * step > boxBottom + 1) {
       dropped = true
       return
     }
     ctx.fillText(value, x, block.y * scale + index * step)
+    painted += 1
   })
 
   // `!fitted.fits` covers what the line loop cannot see: a line wider than

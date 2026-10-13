@@ -407,6 +407,35 @@ describe('compositePage clamping (adjustLayout off)', () => {
     expect(linesPainted()).toHaveLength(1)
   })
 
+  it('never paints zero lines: a box shorter than one line advance still prints', async () => {
+    // The geometry of a running header as the parser stores it — h = 9pt,
+    // its glyph height, against a line advance of 6pt × 1.7 = 10.2pt at the
+    // floor. The clamp used to test `index = 0` too, cut the only line and
+    // dropped the block from every raster page while the HTML export still
+    // printed it (header/footer loss found validating Phase 06). One line
+    // must always land; the lines after it are still cut and still reported.
+    const clipped: string[] = []
+    await compositePage(
+      page([
+        block({
+          id: 'head',
+          y: 13,
+          width: 139,
+          height: 9,
+          fontSize: 9,
+          translatedText: 'မြန်မာနိုင်ငံသည် အရှေ့တောင်အာရှဒေသတွင် တည်ရှိပြီး ရှေးဟောင်းယဉ်ကျေးမှုများ',
+        }),
+      ]),
+      null,
+      { scale: 2, fontStack: '', onClipped: (id) => clipped.push(id) },
+    )
+    // Line 1 of the wrapped text still does not fit — that is reported.
+    expect(clipped).toEqual(['head'])
+    expect(linesPainted()).toHaveLength(1)
+    // …and the survivor sits at the block's own origin, unshifted.
+    expect(linesPainted()[0].args[2]).toBe(13 * 2)
+  })
+
   it('keeps source geometry: the overflowing block is not moved', () => {
     const blocks = [block({ translatedText: words(40) })]
     const out = layoutBlocks(page(blocks), { scale: 1, fontStack: '' }, measure)
