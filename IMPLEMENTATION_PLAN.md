@@ -108,6 +108,16 @@ revert by file. 3.3 must keep the failure path (missing font → warning, not cr
 no unintended duplicates in inspected outputs; Myanmar verified on real pages; limitations
 for complex/scanned PDFs documented. Then report per PHASE-03.
 
+**Status (2026-10-13): complete.** All seven tasks landed as scoped commits (3.1-3.6) plus
+the validation harness (3.7, `scripts/validate-export.mjs`). C-02/L-01, C-03/L-02,
+L-03/C-04, L-07 and L-10 are closed or mitigated with tests + inspected renders; U-03 is
+closed. The 3.7 inspection also found and fixed a pre-existing HTML-export defect (quoted
+font stack broke the block `style` attribute, dropping font-size/color/weight for
+html/pdf/bilingual-pdf/print). The acceptance table and per-page results live in the phase
+notes; known limitations (clamp clips at 6pt instead of reflowing; scanned inpaint
+contrast trade-off; OFL note pending) are recorded in `AUDIT_REPORT.md` §7.2 and
+`docs/CHANGELOG.md`. **Phase 04 may proceed.**
+
 ## 5. Phase 04 — Pre-export editor (`PHASE-04-EDITOR.md`)
 
 **Goal:** prove the existing editor is real, discoverable, and that its edits survive

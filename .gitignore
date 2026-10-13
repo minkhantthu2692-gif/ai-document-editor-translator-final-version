@@ -28,6 +28,9 @@ pnpm-debug.log*
 # Test artifacts
 .vitest-reports
 
+# Export-validation harness artifacts (scripts/validate-export.mjs)
+validate-out/
+
 # Personal notes at the repo root — never committed
 /types-of-pdf-file.md
 

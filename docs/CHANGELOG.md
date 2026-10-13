@@ -8,6 +8,69 @@ cut — everything under `Unreleased` is work in progress on `main`.
 
 ## [Unreleased]
 
+Phase 03 — PDF layout reconstruction, export quality and visual validation.
+
+### Added
+
+- **3.7 export-validation harness** (`scripts/validate-export.mjs`, dev-only): drives the
+  real app over CDP — imports generated fixture PDFs, waits for the structure parse,
+  injects deterministic mock translations at the repo level, exports raster / adjust /
+  print artifacts, rasterises the PDFs back to PNGs via pdf.js, and captures in-app
+  preview screenshots. Supports `--inspect=<fixture>` to re-open a project without
+  wiping artifacts, plus an in-page erase probe (pixel-measures an erased band under the
+  app's own render path). Artifacts land in the git-ignored `validate-out/`.
+- **Fixture coverage for the harness**: text-300p (300 pages, 1502 blocks, includes the
+  2.5× stress block and an EN→Myanmar growth case), table, table-spans, table-continued,
+  slide (landscape), scanned (injected bars), mixed (figure + red head + footers).
+
+### Changed
+
+- **3.1 erase sources — text layer wins**: `planErase` masks text-layer runs *and* the
+  stored block boxes (a box without a matching run still erases); the stored-erase-boxes
+  policy applies to scanned/mixed content only, so text-layer pages no longer erase box
+  areas that carry no glyphs.
+- **3.2 clamp semantics**: font clamping is applied only when `adjustLayout !== true`
+  (the Adjust path pushes instead of shrinking); blocks that still overflow at the floor
+  are marked with a red dashed `strokeRect` (raster) / `.block.overflow` outline (HTML)
+  and reported as `EXPORT_LAYOUT_CLIPPED`.
+- **3.3 export-worker fonts**: collected font faces are registered via `FontFace` in the
+  export worker before measurement, so worker-side text measurement uses the real faces
+  instead of a fallback.
+- **3.4 erase blending (L-07)**: feathered per-side ring repaint — per-side ring medians
+  with bilinear blending — plus `runExtent` at 0.75 em/glyph so degenerate text-run
+  widths no longer collapse (L-10).
+- **3.5 layout suggestions are review-only**: the Layout pass proposes positions/fit
+  sizes but writes nothing on its own; `FIT_MIN_SIZE` pinned to 6pt on both the measure
+  and paint paths.
+- **3.6 fonts ship via `@fontsource`** packages instead of remote CDN loads.
+
+### Fixed
+
+- **HTML-family exports lost every per-block declaration after `font-family`** (found by
+  3.7 visual validation): the font stack quotes its family names (`"Noto Sans Myanmar"`),
+  and the block `style="…"` attribute was interpolated unescaped, so the first inner
+  quote ended the attribute and the parser dropped font-size, line-height, color,
+  font-weight, text-align and min-height. Affected `html`, `pdf`, `bilingual-pdf` and
+  print exports (all text rendered at the inherited size in the body color — the print
+  artifacts showed zero of the fixture's red and `mixed-print` overlapped heavily);
+  the canvas raster path was unaffected. Fix: escape the style value at the single
+  emission point (`src/export/html.ts`), with a regression test asserting the escaped
+  stack and the surviving declarations. Pre-existing since the Phase 01 baseline.
+
+### Notes
+
+- Verified with fixtures + CDP renders only (no live keys; `VERIFY_LIVE=1` stays skipped).
+  Full plan green on current code: 7 fixtures / 10 exports / 25 PNGs / zero errors; every
+  print page inspected after the fix shows the red head, per-block sizes and no overlaps;
+  all 15 raster PNGs are pixel-identical before/after the fix. `npm run typecheck` and
+  `npm run lint` are clean; the full unit suite passes (the one `ProjectsPage` timing
+  flake observed under load is pre-existing and documented in the Phase 02 notes).
+- Known limitations carried forward: raster/clamp clips at the 6pt floor rather than
+  reflowing (by design, reported via `EXPORT_LAYOUT_CLIPPED`); scanned-page inpaint can
+  leave low-contrast text over dark blends (L-07 feather trade-off); the mock translator
+  clips targets at word boundaries and can make adjacent pages identical (harness-only);
+  OFL licensing note for the bundled fonts still pending.
+
 Phase 02 — API consumption, rate limits and translation-pipeline diagnostics.
 
 ### Added

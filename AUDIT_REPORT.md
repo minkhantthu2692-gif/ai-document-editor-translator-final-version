@@ -177,7 +177,11 @@ and 1554 tests pass. Risk if skipped: "tests fail" reports that are really insta
 - The project already knows this class of problem: `src/pdf/pdfAssets.test.ts:15` —
   *"paints glyphs as paths, because a worker cannot install a font"* — the analysis worker
   was handled (`disableFontFace`), the export worker was not.
-- **Status**: registration absence confirmed; visual effect unverified (needs a browser).
+- **Status**: registration absence confirmed. **Resolved in Phase 03/3.3** —
+  `src/export/workerFonts.ts` registers the collected families via `FontFace` +
+  `self.fonts.add()` in the export worker before measurement; pinned by
+  `workerFonts.test.ts` and exercised by the 3.7 harness (fresh browser, families
+  served locally, no OS install).
 
 ### C-05 · Editor → preview → export share one document model (OK, verified)
 `commitCommand()` → `blockRepo.update()` (`src/editor/commands.ts:106-139`); export reads
@@ -290,6 +294,67 @@ All claims here rest on unit tests actually run — no live provider was involve
   express, reasoning headroom, glossary priced) — no gap found, nothing changed. Estimate
   *accuracy* per provider tokenizer remains open (needs live keys, U-01/U-05).
 
+### 7.2 Phase 03 resolutions (2026-10-13)
+
+Code changes were made in Phase 03 (tasks 3.1-3.7). Claims rest on unit tests, the
+3.7 CDP harness renders, and direct pixel/PDF-content inspection of the exported
+artifacts — no live provider was involved.
+
+- **C-02 / L-01 → fixed (3.1).** Erase planning now lets the pdf.js text layer win and
+  masks both the text-layer runs and the stored block boxes (`planErase` in
+  `src/pdf/pageRender.ts`); the stored-erase-boxes policy is applied to scanned/mixed
+  content only, so text-layer pages no longer erase box areas that carry no glyphs.
+  Verified visually on the `scanned` fixture (3 pages: bars become feathered inpaint,
+  injected Myanmar lines are clean, no duplicated original glyphs).
+- **C-03 / L-02 → fixed (3.2).** The raster path clamps only when `adjustLayout !== true`
+  (the Adjust path pushes instead of shrinking), reports `EXPORT_LAYOUT_CLIPPED` via
+  `onClipped`, and marks blocks that still overflow at the 6pt floor with a red dashed
+  `strokeRect` (raster) / `.block.overflow` outline (HTML). Observed in the harness:
+  clamp-mode exports report counts (e.g. text-300p raster = 8, mixed raster = 2),
+  adjust/print exports report none.
+- **L-03 → fixed (3.3, closes C-04).** Collected font faces are registered in the export
+  worker with `FontFace` + `self.fonts.add()` before measurement
+  (`src/export/workerFonts.ts`). Myanmar shaping in raster renders is clean in every
+  inspected page.
+- **L-07 → mitigated (3.4).** Feathered per-side ring repaint: per-side ring medians with
+  bilinear blending instead of one flat colour. Residual trade-off observed and kept:
+  black text loses contrast where the blend darkens toward a bar colour (scanned p1/p3).
+- **L-10 → fixed (3.4).** `runExtent` estimates degenerate text-run widths at 0.75 em per
+  glyph instead of skipping them, so sub-pixel runs are erased too.
+- **3.5 → landed as review-only.** The Layout pass proposes positions/fit sizes and writes
+  nothing on its own; `FIT_MIN_SIZE` pinned to 6pt on both measure and paint paths.
+- **U-03 → closed.** The 3.7 CDP harness renders, rasterises and captures every fixture
+  export; all 10 exports / 25 PNGs were inspected (per-page results in the phase notes).
+  Remaining gaps are listed as limitations, not unknowns.
+- **New finding (3.7 → fixed): HTML-family exports lost every per-block declaration
+  after `font-family`.** The font stack quotes its family names and the block
+  `style="…"` attribute was interpolated unescaped, so the parser ended the attribute at
+  the first inner quote and dropped font-size, line-height, color, font-weight,
+  text-align and min-height for every block. Affected `html`, `pdf`, `bilingual-pdf`
+  and print exports — the print artifacts rendered all text at the inherited size in the
+  body color (`#111827`; the fixture's red head produced **0** red pixels and
+  `mixed-print-p1` overlapped heavily) while the canvas raster path was unaffected.
+  Evidence chain: raw style attribute in the exported HTML → print-PDF content streams
+  contain only `1 1 1 rg` / `0 0 0 rg` / `.0667 .0941 .1529 rg` (no `1 0 0 rg`) → PNG
+  pixel probe of the head band = (17,24,39) → figure `<img>` kept its colors (baked
+  pixels). Fix: escape the style value at the single emission point
+  (`src/export/html.ts`), regression test in `html.test.ts`. After the fix every print
+  page shows the red head, per-block sizes and no overlaps; all 15 raster PNGs are
+  pixel-identical before/after. Pre-existing since the Phase 01 baseline (`html.ts`
+  untouched since `178d4a7`).
+- **Not a defect (closed with evidence): "missing" red overflow flags.** Two distinct
+  signals: `block.overflow` (editor-model flag written by `src/editor/layout.ts` when the
+  user's own translation does not fit) drives the painted outline; `EXPORT_LAYOUT_CLIPPED`
+  is the export-time clamp report (`onClipped`) and never sets that flag. The 3.7 mock
+  writes `translatedText` at repo level and bypasses the editor pass, so no stored block
+  carries `overflow: true` — no flags anywhere is expected. Flag drawing is pinned by
+  `composite.test.ts`.
+- **Not a defect (closed with evidence): identical text-300p pages 2/4.** Stored model
+  pages differ but the harness mock clips each target at the last space, and the
+  Myanmar sentence stream has long space-free runs, so all body targets collapse to the
+  same string; blank post-erase backgrounds then composite identically. Harness
+  mock-fidelity limitation only.
+
 ## 8. Findings — Unknown (need credentials / browser / data)
 
 - **U-01** Real provider rate-limit, quota and header behaviour per model. The harness
@@ -297,8 +362,9 @@ All claims here rest on unit tests actually run — no live provider was involve
   unavailable here; nothing was simulated as a result.
 - **U-02** Token-estimate accuracy vs each provider tokenizer (calibration code exists; no
   before/after numbers recorded).
-- **U-03** Rendered-page visual inspection of exported PDFs (needs dev server + browser;
-  `scripts/diagnose-render.mjs` and `scripts/smoke.mjs` are the available tools).
+- **U-03** ~~Rendered-page visual inspection of exported PDFs~~ — **closed in Phase 03
+  (3.7)**: the CDP harness renders every fixture export to PNGs and they were inspected
+  (see §7.2 and the phase notes).
 - **U-04** OCR quality and sidecar parity on real scans (offline parity tests pass:
   `src/sidecar/extractParity.test.ts`).
 - **U-05** Whether each adapter's reported `tokensIn` includes chat-template overhead —
@@ -376,3 +442,21 @@ flaky `ProjectsPage` timing test was observed once under full-suite load and was
 re-run, in isolation, and in both subsequent full runs — untouched file, unrelated to this
 phase. Secret-pattern scan of `src/` + phase documents: 0 matches. Remaining provider-side
 items (U-01, U-05) need live keys. Phase 03 (PDF export) may proceed.
+
+Phase 03 (2026-10-13) is complete: tasks 3.1-3.7 landed as seven scoped commits —
+erase planning (C-02/L-01), clamp/reporting semantics (C-03/L-02), worker font
+registration (L-03, closes C-04), feathered per-side repaint (L-07) and degenerate-run
+erasing (L-10), review-only layout suggestions with the 6pt floor pinned, @fontsource
+fonts, and the CDP visual-validation harness. The harness found and closed a
+pre-existing export defect: HTML-family exports (html/pdf/bilingual-pdf/print) dropped
+every per-block declaration after `font-family` because the quoted font stack broke the
+`style` attribute — fixed with one escaping change plus a regression test (§7.2).
+Evidence: full plan green (7 fixtures / 10 exports / 25 PNGs / zero errors), every
+print page re-inspected after the fix, raster pages pixel-identical before/after, erase
+probe confirms in-browser erase under the app's own path. Final gates: `typecheck` ✅,
+`lint` ✅, full suite ✅ 1626 passed / 6 skipped (107/108 files; the 1 skipped file
+remains the env-gated `VERIFY_LIVE=1` suite). One pre-existing flaky `ProjectsPage`
+timing test was observed once under load and was green on re-run, in isolation, and in
+the next full run — untouched file, unrelated to this phase. Provider-side items
+(U-01, U-05) still need live keys; the OFL note for the bundled fonts is still
+outstanding. Phase 04 (pre-export editor) may proceed.

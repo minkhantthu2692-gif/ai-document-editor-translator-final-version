@@ -225,6 +225,20 @@ describe('buildHtmlDocument (absolute)', () => {
     expect(buildHtmlDocument(over, base)).toContain('block overflow')
   })
 
+  it('keeps every inline declaration when the font stack quotes its families', () => {
+    // The default stack is `…, "Noto Sans Myanmar", "Padauk", sans-serif`. Left
+    // unescaped in `style="…"`, the first inner quote ends the attribute and the
+    // parser silently drops font-size, line-height, color and font-weight — the
+    // block then renders at the inherited size in the wrong color (3.7 finding).
+    const html = buildHtmlDocument(doc(), base)
+    const tag = /<[a-z0-9]+[^>]*class="[^"]*\bblock\b[^>]*>/.exec(html)?.[0] ?? ''
+    const style = /style="([^"]*)"/.exec(tag)?.[1] ?? ''
+    expect(style).toContain('&quot;Noto Sans Myanmar&quot;')
+    expect(style).toContain('font-size:11pt')
+    expect(style).toContain('color:#111827')
+    expect(style).toContain('text-align:left')
+  })
+
   it('inlines the font CSS it is given', () => {
     const withFonts = buildHtmlDocument(doc(), {
       ...base,
@@ -562,7 +576,7 @@ describe('code blocks', () => {
   it('pins the absolute layout to a monospace stack and marks the block', () => {
     const html = buildHtmlDocument(codeDoc(), base)
     expect(html).toContain('class="block code"')
-    expect(html).toMatch(/class="block code"[^>]*font-family:"Courier New"/)
+    expect(html).toMatch(/class="block code"[^>]*font-family:&quot;Courier New&quot;/)
     expect(html).toContain('tab-size:4')
   })
 

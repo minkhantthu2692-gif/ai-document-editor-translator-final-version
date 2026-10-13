@@ -255,7 +255,13 @@ function blockHtml(block: ExportBlock, options: HtmlOptions, classes: string[]):
   return (
     `<${tag} class="${classes.join(' ')}${faceClass(block)}${table ? ' has-table' : ''}${
       flagged
-    }"` + ` data-block-id="${escapeHtml(block.id)}"${dir} style="${style}">${content}</${tag}>`
+    }"` +
+    // The style carries the font stack, whose family names are quoted
+    // (`"Noto Sans Myanmar"`). Unescaped, that inner `"` ends the attribute at
+    // the first family name and every later declaration — font-size, line-height,
+    // color, font-weight, min-height — is dropped by the parser. Escaping turns
+    // it back into a plain `"` once the browser decodes the attribute.
+    ` data-block-id="${escapeHtml(block.id)}"${dir} style="${escapeHtml(style)}">${content}</${tag}>`
   )
 }
 
