@@ -456,7 +456,12 @@ ${print ? '.page { border: none; }' : ''}
   ${print ? 'break-inside: avoid; page-break-inside: avoid;' : ''}
 }
 .block .marker { font-weight: 700; }
-.block.overflow { outline: 1px dashed #dc2626; outline-offset: 1px; }
+/* An overflowing block keeps its "overflow" class as metadata (the editor
+   badge, the EXPORT_LAYOUT_CLIPPED report and any consumer stylesheet read
+   it), but the export no longer paints a red dashed box around it: that was
+   review scaffolding, and it shipped as decoration inside the user's
+   deliverable. The overflow signal now surfaces only where it belongs — the
+   editor's amber edge + badge, and the layout report. */
 .block.suggested { box-shadow: inset 2px 0 0 #2563eb; }
 /* A code snippet keeps its line breaks and its columns. The absolute layout
    already carries the monospace stack inline (fontStackForCode), so this

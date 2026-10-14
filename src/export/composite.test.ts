@@ -458,12 +458,16 @@ describe('compositePage clamping (adjustLayout off)', () => {
     expect(linesPainted()).toHaveLength(4)
   })
 
-  it('paints the same red flag the HTML export draws for an overflow block', async () => {
+  it('paints no red flag for an overflow block (review scaffolding removed)', async () => {
+    // The overflow flag used to be drawn as a red dashed `strokeRect` around
+    // the block in the deliverable. That was review scaffolding leaking into
+    // user-facing output, so it is gone; overflow now surfaces only through
+    // the layout report (onClipped / EXPORT_LAYOUT_CLIPPED) and the editor.
     await compositePage(page([block({ overflow: true, translatedText: 'Flag me' })]), null, {
       scale: 1,
       fontStack: '',
     })
-    expect(flagsPainted()).toEqual([{ op: 'strokeRect', args: [72, 72, 468, 14] }])
+    expect(flagsPainted()).toEqual([])
   })
 
   it('draws no flag on a healthy block', async () => {

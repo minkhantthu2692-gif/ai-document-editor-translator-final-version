@@ -1650,6 +1650,80 @@ function buildAnnotationsPdf() {
   return writer.render()
 }
 
+/**
+ * One page of coloured text drawn the way a real document processor writes it:
+ * every run is wrapped in `q … cm … q … rg … BT … Tm … Tj … ET … Q … Q`.
+ *
+ * This is the exact shape that broke colour extraction. The exporter used to
+ * reconstruct each run's position in *local* space — ignoring the `cm`
+ * (`OPS.transform`) concatenation, the `q`/`Q` save-restore, and the fact that
+ * pdf.js hands `Tm`/`cm` matrices as a `Float32Array` nested in the args. Every
+ * run collapsed near the origin, the nearest-run matcher could not tell them
+ * apart, and it painted each page a single colour — on a navy-band document
+ * that meant white-on-white *invisible* text in the editor and the export.
+ *
+ * The page carries the palette that made the bug visible:
+ *   - a navy band with a **white** title on it (white that must not leak past
+ *     its `Q` and must not drown the dark body),
+ *   - a maroon subheading,
+ *   - two dark body paragraphs.
+ *
+ * A committed test drives this through the real pdf.js operator list (whose
+ * matrix args are Float32Array) and asserts each block recovers its own colour.
+ */
+function buildColoredPdf() {
+  const writer = new PdfWriter()
+  const pagesNum = addPagesObject(writer)
+  const regular = writer.add(FONT_REGULAR)
+  const bold = writer.add(FONT_BOLD)
+  const resources = `/Font << /F1 ${regular} 0 R /F2 ${bold} 0 R >>`
+
+  // Fill-colour triples (0..1) and the hex each must recover to.
+  const NAVY = '0.121569 0.227451 0.372549' // #1f3a5f
+  const WHITE = '1 1 1' // #ffffff
+  const BODY = '0.168627 0.168627 0.168627' // #2b2b2b
+  const MAROON = '0.541176 0.121569 0.168627' // #8a1f2b
+
+  /** A text run at a page-space origin, wrapped in the real graphics state. */
+  const run = (x, y, size, font, rgb, text) =>
+    [
+      'q\n',
+      `1 0 0 1 ${x} ${y} cm\n`, // concatenate a translate onto the CTM
+      `${rgb} rg\n`, // the fill this run is painted in
+      'BT\n',
+      `/${font} ${size} Tf\n`,
+      '1 0 0 1 0 0 Tm\n', // text matrix at the local origin
+      `(${escape(text)}) Tj\n`,
+      'ET\n',
+      'Q\n', // restore the CTM *and* the fill
+    ].join('')
+
+  const parts = [
+    // The navy band behind the title: a fill whose colour must not leak.
+    `q\n${NAVY} rg\n62 740 488 34 re\nf\nQ\n`,
+    run(72, 750, 16, 'F2', WHITE, 'Quarterly Results'),
+    run(72, 700, 11, 'F2', MAROON, 'Revenue and Costs'),
+    run(72, 676, 11, 'F1', BODY, 'Revenue rose twelve percent against the same quarter.'),
+    run(72, 660, 11, 'F1', BODY, 'Operating costs were held flat for the third period.'),
+  ].join('')
+
+  const page = addPage(
+    writer,
+    pagesNum,
+    resources,
+    writer.addStream('', Buffer.from(parts, 'latin1')),
+  )
+  finalizePages(writer, pagesNum, [page])
+  writer.setInfo({
+    Title: 'Coloured runs in nested graphics states',
+    Creator: 'make-fixtures.mjs',
+    Producer: 'make-fixtures.mjs',
+    CreationDate: "D:20260115093000+06'30'",
+    ModDate: "D:20260320174500+06'30'",
+  })
+  return writer.render()
+}
+
 mkdirSync(OUT, { recursive: true })
 const outputs = [
   ['text-300p.pdf', buildTextPdf(300)],
@@ -1668,6 +1742,7 @@ const outputs = [
   ['figure.pdf', buildFigurePdf()],
   ['form.pdf', buildFormPdf()],
   ['annotations.pdf', buildAnnotationsPdf()],
+  ['colored.pdf', buildColoredPdf()],
 ]
 for (const [name, buffer] of outputs) {
   writeFileSync(join(OUT, name), buffer)

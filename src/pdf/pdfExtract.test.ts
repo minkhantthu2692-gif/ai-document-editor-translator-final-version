@@ -1129,6 +1129,44 @@ describe('annotations.pdf', () => {
   })
 })
 
+describe('colored.pdf', () => {
+  // Regression for the invisible-text bug: real PDFs wrap each run in
+  // `q … cm … q … rg … BT … Tm … Tj … ET … Q … Q` and pdf.js hands the `Tm`/`cm`
+  // matrices as a Float32Array nested in the args. The exporter used to ignore
+  // the `cm` concatenation and the `q`/`Q` restore, so every run's position
+  // collapsed to the origin and the nearest-run matcher painted the whole page
+  // one colour — a white title on a navy band drowned every dark body line in
+  // white-on-white. Here each block must recover its own colour.
+  let blocks: Awaited<ReturnType<typeof extractPage>>['blocks']
+
+  beforeAll(async () => {
+    const doc = await open('colored.pdf')
+    blocks = await extractAt(doc, 0).then((page) => page.blocks)
+  })
+
+  const colorOf = (needle: string): string | undefined =>
+    blocks.find((block) => block.text.includes(needle))?.color
+
+  it('keeps the white title its own colour, not the whole page', () => {
+    expect(colorOf('Quarterly Results')).toBe('#ffffff')
+  })
+
+  it('keeps the maroon subheading', () => {
+    expect(colorOf('Revenue and Costs')).toBe('#8a1f2b')
+  })
+
+  it('keeps the dark body text dark (not drowned by the white title)', () => {
+    expect(colorOf('Revenue rose twelve percent')).toBe('#2b2b2b')
+    expect(colorOf('Operating costs were held flat')).toBe('#2b2b2b')
+  })
+
+  it('assigns more than one colour across the page', () => {
+    // The whole bug was one colour per page; a healthy page has several.
+    const palette = new Set(blocks.map((block) => block.color))
+    expect(palette.size).toBeGreaterThanOrEqual(3)
+  })
+})
+
 describe('needsSidecarFallback', () => {
   const page = (charCount: number, blocks: ExtractedPage['blocks']): ExtractedPage => ({
     pageIndex: 0,

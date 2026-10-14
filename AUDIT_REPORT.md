@@ -783,3 +783,31 @@ Open editor entry is visible and links to `/workspace/:id`, delete-all ends at
 `npm run smoke` ✅ **165/165** with a clean console. Export-affecting code was untouched and
 smoke's export checks still pass, so the full export harness was not re-run (Phase 04/06
 evidence stands). Live-provider items (U-01/U-05) and the OFL note remain blocked as before.
+
+Colour/export follow-up (2026-10-14, one user report: exported HTML and the editor showed
+wrong/invisible text colours and red dashed boxes) is complete. Diagnosis came before any
+edit. The reported export (`hss-exam-study-notes (1).html`, 233 blocks) had a colour
+histogram of `#ffffff:171` — pages 2/3/4/6/7/9/11/12 were 100% white. The design layer was
+fine (backgrounds rendered correctly, text erased correctly); the defect was colour
+*assignment*. **Confirmed root cause** (`src/pdf/pdfOps.ts`): the operator-list walker
+reconstructed each text run's position in local space and ignored the graphics state real
+PDFs use — `q … cm … q … rg … BT … Tm … Tj … ET … Q … Q`. Three defects compounded: the
+`cm` (`OPS.transform`) concatenation was never applied, `q`/`Q` never pushed/popped the CTM
+or the fill colour, and the text matrix was read as `args[1..5]` — `undefined` for the
+`[Float32Array]` shape pdf.js actually emits. Every run collapsed to near the origin, so the
+nearest-run matcher (`assignColors`) could not distinguish them and painted each page one
+colour (a white title on a navy band drowned all dark body text in white-on-white).
+Reproduced through the app's own `extractPage` against the user's real source PDF, then
+fixed: `traceTextRuns` now tracks the CTM (`cm` + form-XObject `Matrix`), a `q`/`Q` state
+stack (CTM *and* fill), and reads matrices from either arg shape; `assignColors` advances
+through co-located runs. Re-ran the same probe: per-block colours went from one wrong colour
+per page to the correct palette (`#1f3a5f`/`#2b2b2b`/`#8a1f2b`/`#ffffff`-on-band only).
+Second confirmed defect: the export shipped `.block.overflow { outline: 1px dashed #dc2626 }`
+(HTML) and the same red `strokeRect` (raster/PDF) — review scaffolding inside the user's
+deliverable; removed from both, with the `overflow` flag kept as metadata (editor badge,
+layout report). Coverage: new `fixtures/colored.pdf` (the exact nested `q/cm/rg/BT/Tm/Tj`
+shape) driven through `extractPage` asserting per-block colours, plus `pdfOps` unit tests for
+the transform, colour-restore, form-matrix and Float32Array cases. Final gates: `typecheck`
+✅, `lint` ✅, full suite ✅ 1654 passed / 6 skipped (112 files; +10 tests), `npm run build` ✅,
+`node scripts/validate-export.mjs` ✅ 7 fixtures `errors=none`. Live-provider items
+(U-01/U-05) and the OFL note remain blocked as before.

@@ -209,7 +209,11 @@ describe('buildHtmlDocument (absolute)', () => {
     expect(buildHtmlDocument(empty, base)).not.toContain('data-block-id')
   })
 
-  it('flags overflowing blocks for review', () => {
+  it('keeps the overflow class as metadata but ships no red-box rule', () => {
+    // The `overflow` class stays on the element as metadata (the editor badge,
+    // the layout report and any consumer stylesheet read it), but the export
+    // must not paint a red dashed box around it — that was review scaffolding
+    // that shipped as decoration inside the user's deliverable.
     const over = doc({
       pages: [
         {
@@ -222,7 +226,10 @@ describe('buildHtmlDocument (absolute)', () => {
         },
       ],
     })
-    expect(buildHtmlDocument(over, base)).toContain('block overflow')
+    const html = buildHtmlDocument(over, base)
+    expect(html).toContain('block overflow')
+    expect(html).not.toContain('.block.overflow')
+    expect(html).not.toContain('#dc2626')
   })
 
   it('keeps every inline declaration when the font stack quotes its families', () => {

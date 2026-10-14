@@ -8,6 +8,49 @@ cut — everything under `Unreleased` is work in progress on `main`.
 
 ## [Unreleased]
 
+**Colour/export follow-up round** — the exported HTML and the editor showed wrong text
+colours (much of the text rendered white-on-white and looked invisible), and the export
+painted red dashed boxes around overflowing blocks.
+
+### Fixed
+
+- **Text colour no longer collapses to one wrong colour per page**
+  (`src/pdf/pdfOps.ts`): the operator-list walker that assigns each text run its fill
+  colour reconstructed run positions in *local* space and ignored the graphics state real
+  PDFs rely on. Source documents wrap every run in `q … cm … q … rg … BT … Tm … Tj … ET …
+  Q … Q`, and pdf.js hands the `Tm`/`cm` matrices as a `Float32Array` nested in the args.
+  Three defects compounded: the `cm` (`OPS.transform`) concatenation was never applied, the
+  `q`/`Q` save-restore never pushed/popped the CTM or the fill colour, and the text matrix
+  was read by destructuring `args[1..5]` — `undefined` for a one-element `[Float32Array]`.
+  Every run's position collapsed near the origin, so the nearest-run matcher could not tell
+  them apart and painted each page a single colour; on a navy-band document that meant a
+  white title drowned every dark body line in white-on-white. `traceTextRuns` now tracks the
+  CTM (`cm`, form-XObject `Matrix`), a `q`/`Q` state stack (CTM *and* fill), and reads
+  matrices from either arg shape; run positions are emitted in page space to match pdf.js's
+  item transforms. `assignColors` also advances through co-located runs so a glyph-group
+  split no longer stalls the pointer on one colour. Verified end-to-end against the user's
+  real source PDF: per-block colours went from one wrong colour per page (8 of 12 pages
+  all-white) to the correct palette (`#1f3a5f` titles, `#2b2b2b` body, `#8a1f2b`
+  subheadings, `#ffffff` only on the navy band).
+- **Export no longer paints red dashed boxes around overflowing blocks**
+  (`src/export/html.ts`, `src/export/composite.ts`): `.block.overflow` drew a red dashed
+  outline in the HTML deliverable and the raster/PDF path stroked the same `#dc2626`
+  rectangle. Both were review scaffolding that shipped as decoration inside the user's
+  document. The `overflow` class/flag is kept as metadata (editor badge, layout report,
+  JSON export), but the painted box is gone; overflow still surfaces through the editor's
+  amber edge + badge and the `EXPORT_LAYOUT_CLIPPED` layout report.
+
+### Added
+
+- **`fixtures/colored.pdf`** (`scripts/make-fixtures.mjs`): a one-page fixture drawing each
+  run in the real `q … cm … q … rg … BT … Tm … Tj … ET … Q … Q` shape — a white title on a
+  navy band, a maroon subheading, dark body — so the colour path is regression-tested
+  through the actual pdf.js operator list (whose matrix args are `Float32Array`).
+  `src/pdf/pdfExtract.test.ts` drives it through `extractPage` and asserts each block
+  recovers its own colour and the page carries more than one. New `pdfOps` unit tests pin
+  the `cm` transform, the `q`/`Q` colour restore, the form-XObject matrix, and the
+  Float32Array arg shape.
+
 **Follow-up round** — three user reports after release: the landing/first-time-setup screen
 not being visible, "Delete all local data" refreshing into the settings page, and the
 pre-export editor not being discoverable from the translation page.

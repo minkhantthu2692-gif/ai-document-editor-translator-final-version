@@ -232,7 +232,13 @@ export function normalizeColor(args: unknown[] | undefined): string | null {
   return null
 }
 
-/** Position of the current text run in PDF user space (bottom-left origin). */
+/**
+ * Position of the current text run in PDF *page* space (bottom-left origin).
+ *
+ * Positions are reported after the current transformation matrix (CTM) has
+ * been applied, so they line up with the device-space transforms pdf.js
+ * reports on each `getTextContent()` item.
+ */
 export interface TextRun {
   color: string | null
   x: number
@@ -240,16 +246,100 @@ export interface TextRun {
 }
 
 /**
+ * A 3×3 affine PDF matrix stored as `[a, b, c, d, e, f]`. A point `(x, y)`
+ * maps to `(a·x + c·y + e, b·x + d·y + f)`.
+ */
+type Matrix = readonly [number, number, number, number, number, number]
+
+const IDENTITY: Matrix = [1, 0, 0, 1, 0, 0]
+
+/**
+ * Reads an affine matrix from an array-like value (a plain `number[]` or a
+ * `Float32Array`, which is how pdf.js hands over `Tm` and form-XObject
+ * matrices). Returns `null` unless the first six entries are finite numbers.
+ */
+function asMatrix(value: unknown): Matrix | null {
+  if (value == null) return null
+  const arr = value as ArrayLike<unknown>
+  if (typeof arr.length !== 'number' || arr.length < 6) return null
+  const [a, b, c, d, e, f] = [arr[0], arr[1], arr[2], arr[3], arr[4], arr[5]]
+  if (![a, b, c, d, e, f].every((n) => typeof n === 'number' && Number.isFinite(n))) {
+    return null
+  }
+  return [a as number, b as number, c as number, d as number, e as number, f as number]
+}
+
+/**
+ * Extracts a matrix from an operator's args. Depending on the operator and
+ * pdf.js version the six numbers are either the args themselves (`cm`) or
+ * nested in the first arg (`Tm`, form-XObject `Matrix`).
+ */
+function matrixFromArgs(args: unknown[]): Matrix | null {
+  return asMatrix(args) ?? asMatrix(args[0])
+}
+
+/**
+ * Concatenates two matrices so the result applies `inner` first, then `outer`:
+ * `compose(outer, inner)(p) === outer(inner(p))`. This mirrors PDF's
+ * `CTM' = CTM × M` for a `cm M` operator.
+ */
+function compose(outer: Matrix, inner: Matrix): Matrix {
+  const [a1, b1, c1, d1, e1, f1] = outer
+  const [a2, b2, c2, d2, e2, f2] = inner
+  return [
+    a1 * a2 + c1 * b2,
+    b1 * a2 + d1 * b2,
+    a1 * c2 + c1 * d2,
+    b1 * c2 + d1 * d2,
+    a1 * e2 + c1 * f2 + e1,
+    b1 * e2 + d1 * f2 + f1,
+  ]
+}
+
+/** Applies an affine matrix to a point. */
+function applyMatrix(m: Matrix, x: number, y: number): [number, number] {
+  return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]]
+}
+
+/** A saved graphics state (`q` / form-XObject boundary). */
+interface GraphicsState {
+  ctm: Matrix
+  color: string | null
+}
+
+/**
  * Walks the operator list reconstructing (approximately) where each text run
- * started and which fill colour was in force. Glyph advances are ignored — the
- * start position is all the matcher needs.
+ * started, in page space, and which fill colour was in force. Glyph advances
+ * are ignored — the start position is all the matcher needs.
+ *
+ * This tracks the graphics state that many real PDFs rely on:
+ * - `cm` (`OPS.transform`) concatenates onto the current transformation
+ *   matrix, so text drawn inside a translated/scaled block reports its true
+ *   page-space position instead of collapsing near the origin.
+ * - `q`/`Q` (`OPS.save`/`OPS.restore`) push and pop the CTM *and* the fill
+ *   colour, so a colour set inside a `q…Q` scope does not leak past the `Q`.
+ * - Form XObjects (`OPS.paintFormXObjectBegin`/`End`) contribute their own
+ *   `Matrix` argument and restore the state at their end.
  */
 export function traceTextRuns(ops: OpList): TextRun[] {
   const runs: TextRun[] = []
+  let ctm: Matrix = IDENTITY
   let color: string | null = null
   let x = 0
   let y = 0
   let leading = 0
+  const stack: GraphicsState[] = []
+
+  const push = (): void => {
+    stack.push({ ctm, color })
+  }
+  const pop = (): void => {
+    const saved = stack.pop()
+    if (saved) {
+      ctm = saved.ctm
+      color = saved.color
+    }
+  }
 
   const { fnArray, argsArray } = ops
   for (let index = 0; index < fnArray.length; index += 1) {
@@ -262,15 +352,35 @@ export function traceTextRuns(ops: OpList): TextRun[] {
       continue
     }
     switch (fn) {
+      case OPS.save:
+        push()
+        break
+      case OPS.restore:
+        pop()
+        break
+      case OPS.transform: {
+        const m = matrixFromArgs(args)
+        if (m) ctm = compose(ctm, m)
+        break
+      }
+      case OPS.paintFormXObjectBegin: {
+        push()
+        const m = asMatrix(args[0])
+        if (m) ctm = compose(ctm, m)
+        break
+      }
+      case OPS.paintFormXObjectEnd:
+        pop()
+        break
       case OPS.beginText:
         x = 0
         y = 0
         break
       case OPS.setTextMatrix: {
-        const [, , , , e, f] = args as number[]
-        if (Number.isFinite(e) && Number.isFinite(f)) {
-          x = e
-          y = f
+        const m = matrixFromArgs(args)
+        if (m) {
+          x = m[4]
+          y = m[5]
         }
         break
       }
@@ -294,7 +404,10 @@ export function traceTextRuns(ops: OpList): TextRun[] {
         x = 0
         break
       default:
-        if (TEXT_OPS.has(fn)) runs.push({ color, x, y })
+        if (TEXT_OPS.has(fn)) {
+          const [px, py] = applyMatrix(ctm, x, y)
+          runs.push({ color, x: px, y: py })
+        }
         break
     }
   }
@@ -335,10 +448,14 @@ export function assignColors(ops: OpList, items: Positioned[]): Array<string | n
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index]
     if (!item?.transform) continue
+    // Advance to the nearest run, moving through co-located runs (a single
+    // text operator is often split into several glyph-group runs at the same
+    // start position) so the pointer never stalls on a group of identical
+    // positions and mis-assigns the whole page one colour.
     while (runIndex + 1 < runs.length) {
       const current = distance(item, runs[runIndex])
       const next = distance(item, runs[runIndex + 1])
-      if (next >= current) break
+      if (next > current) break
       runIndex += 1
     }
     colors[index] = runs[runIndex].color

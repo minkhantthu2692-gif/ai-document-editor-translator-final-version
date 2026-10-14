@@ -142,18 +142,11 @@ function drawBlock(
   // that only just exceeds the box can round into place.
   if (clamp && (dropped || !fitted.fits)) options.onClipped?.(block.id)
 
-  // The same red flag the HTML export draws (`.block.overflow`, print mode
-  // included): the model already knows this block's text outgrew its source
-  // box, and the image export must say so too rather than look pristine.
-  // Painting the flag is what "honour `block.overflow`" means here — the
-  // *count* in `EXPORT_LAYOUT_CLIPPED` stays the worker's own measurement.
-  if (block.overflow) {
-    ctx.setLineDash([4 * scale, 3 * scale])
-    ctx.strokeStyle = '#dc2626'
-    ctx.lineWidth = Math.max(1, scale)
-    ctx.strokeRect(block.x * scale, block.y * scale, block.width * scale, block.height * scale)
-    ctx.setLineDash([])
-  }
+  // An overflowing block used to be painted here with the same red dashed box
+  // the HTML export drew. Both were review scaffolding that shipped as
+  // decoration inside the user's deliverable, so the painted flag is gone.
+  // The overflow signal still reaches the user where it belongs: the layout
+  // report (`onClipped` / EXPORT_LAYOUT_CLIPPED) and the editor's own badge.
 }
 
 /**
