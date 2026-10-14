@@ -811,3 +811,31 @@ the transform, colour-restore, form-matrix and Float32Array cases. Final gates: 
 ✅, `lint` ✅, full suite ✅ 1654 passed / 6 skipped (112 files; +10 tests), `npm run build` ✅,
 `node scripts/validate-export.mjs` ✅ 7 fixtures `errors=none`. Live-provider items
 (U-01/U-05) and the OFL note remain blocked as before.
+
+Page-growth / auto-fit layout (2026-10-14, user request: the export should preserve the
+original structure/size/type/colour for *any* file, and when a longer translation outgrows
+the page it should wrap and flow onto a new page — page count may grow) is complete for the
+export path. First, scope was verified with evidence rather than assumed: structure, font
+family, size, bold/italic and colour are captured per block in `PageBlock` (`structure.ts`)
+and re-applied by `blockStyle` (`html.ts`) for every block of every file — that half was
+already general; the only gap was page growth. **Confirmed limitation before the change**:
+`reflowBlocks` (`reflow.ts`) is a push-down *within a fixed page* — its own header states
+"the page cannot grow… a push stops at the bottom edge" — so overflow was clamped and
+reported as `EXPORT_LAYOUT_CLIPPED`, never flowed to a new sheet. Fixed by adding
+`paginateBlocks` (`src/export/pagination.ts`, wired into `absolutePage` in `html.ts`): one
+source page's blocks are split into N same-size **sheets**, sheet 0 byte-identical when
+nothing overflows, each overflowing block starting a fresh sheet at the top instead of
+clamping. Columns flow independently; a full-width band realigns everything under it; only
+`y` and the sheet change (same `blockPrintHeight` reflow measures). This covers the screen
+`.html` export *and* print-to-PDF, both via `absolutePage`. `reflowBlocks` is untouched, so
+raster/image exports (source-geometry promise) and the editor canvas keep their push-down
+behaviour with no regression; growing the editor preview (a text-only continuation pane
+behind the fixed-size page image) and raster growth are the next increment. Coverage: new
+`src/export/pagination.test.ts` (13 cases — identity, single/multi-sheet growth, independent
+columns, spanning-band realignment + growth, taller-than-sheet overflow report, all-wide
+single column) and an updated `html.test.ts` (overflow grows a second `<section class="page">`
+and is no longer clipped; a taller-than-sheet block still is). Final gates: `typecheck` ✅,
+`lint` ✅, full suite ✅ 1668 passed / 6 skipped (113 files; +14 tests), `npm run build` ✅,
+`node scripts/validate-export.mjs` ✅ 7 fixtures `errors=none` (incl. the 1502-block
+`text-300p` through the print path). Live-provider items (U-01/U-05) and the OFL note
+remain blocked as before.

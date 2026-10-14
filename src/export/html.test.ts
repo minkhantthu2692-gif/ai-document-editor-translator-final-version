@@ -522,10 +522,10 @@ describe('absolute export height handling', () => {
     expect(html).toContain('min-height:14pt')
   })
 
-  it('names the blocks the page edge stopped it from clearing', () => {
-    // a grows at the foot of the page; the push lands b past 792pt, so b is
-    // parked at the edge — still under a. That is worth a name, because the
-    // reader is looking at an overlap and the export said nothing.
+  it('grows a second page for the block the page edge used to clip', () => {
+    // a grows at the foot of the page; the surplus used to push b past 792pt
+    // and park it on top of a. Now b runs onto a fresh sheet instead, so
+    // nothing is clipped and the reader gains a page rather than an overlap.
     const page = doc({
       pages: [
         {
@@ -542,8 +542,32 @@ describe('absolute export height handling', () => {
       ],
     })
     const clipped: string[] = []
+    const html = buildHtmlDocument(page, base, measure, (id) => clipped.push(id))
+    expect(clipped).toEqual([])
+    expect(html.match(/<section class="page/g)?.length).toBe(2)
+    // a keeps the original page anchor; b lands on the continuation sheet.
+    expect(html).toContain('id="page-1"')
+    expect(html).toContain('id="page-1-1"')
+  })
+
+  it('still names a block taller than a whole sheet', () => {
+    // The one case where clipping is unavoidable: a block that cannot fit a
+    // full page of its own is laid at the top of a fresh sheet and reported.
+    const page = doc({
+      pages: [
+        {
+          index: 0,
+          width: 612,
+          height: 792,
+          rotation: 0,
+          contentClass: 'text',
+          blocks: [block({ id: 'giant', y: 72, height: 900, translatedText: words(25) })],
+        },
+      ],
+    })
+    const clipped: string[] = []
     buildHtmlDocument(page, base, measure, (id) => clipped.push(id))
-    expect(clipped).toEqual(['b'])
+    expect(clipped).toEqual(['giant'])
   })
 
   it('reports nothing when every block clears', () => {

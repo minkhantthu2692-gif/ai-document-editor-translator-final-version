@@ -82,10 +82,10 @@ function overlapsInX(a: ReflowBlock, b: ReflowBlock): boolean {
  * box the PDF gave it, so the original rhythm of the page survives — and a
  * block that *is* pushed carries its whole box, not just the line inside it.
  */
-function heightFor<T extends ReflowBlock>(
+export function blockPrintHeight<T extends ReflowBlock>(
   block: T,
   text: string,
-  options: ReflowOptions<T>,
+  measure: TextMeasurer,
 ): number {
   if (text.trim().length === 0) return block.height
   // No bbox and no extracted size means there is nothing to measure against;
@@ -96,7 +96,7 @@ function heightFor<T extends ReflowBlock>(
     { width: block.width, height: block.height },
     block.fontSize,
     block.lineHeight,
-    options.measure,
+    measure,
     { fontFamily: block.fontFamily, bold: block.bold, italic: block.italic },
   )
   return Math.max(block.height, measured.height)
@@ -111,7 +111,7 @@ interface Placed<T extends ReflowBlock> {
 export function reflowBlocks<T extends ReflowBlock>(blocks: T[], options: ReflowOptions<T>): T[] {
   const heights = new Map<string, number>()
   for (const block of blocks) {
-    heights.set(block.id, heightFor(block, options.textOf(block), options))
+    heights.set(block.id, blockPrintHeight(block, options.textOf(block), options.measure))
   }
 
   // Top to bottom, so every block is only ever pushed by one already placed.

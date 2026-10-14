@@ -8,6 +8,45 @@ cut — everything under `Unreleased` is work in progress on `main`.
 
 ## [Unreleased]
 
+**Page-growth (auto-fit layout)** — a longer translation that outgrew the source page was
+squeezed into the fixed page box: auto-fit shrank it to a 6pt floor, reflow pushed the
+neighbours down, and whatever still would not fit was clamped at the bottom edge and
+reported as clipped. The user asked for the text to run onto a new page instead — page
+count may grow, which is expected and fine (an 8-page original can legitimately translate
+into 10).
+
+### Added
+
+- **The absolute export grows pages instead of clamping** (`src/export/pagination.ts`,
+  wired into `src/export/html.ts`): a new `paginateBlocks` pass turns one source page's
+  blocks into one or more vertical **sheets** of the same size. Sheet 0 is the original
+  page — a document whose text all still fits comes back byte-identical — and every block
+  that would run past the bottom starts a fresh sheet at the top rather than clamping.
+  This covers the screen `.html` export *and* the print-to-PDF path, both of which flow
+  through `absolutePage`. Three rules keep the growth honest: columns flow independently
+  (a longer left column does not drag the right one down with it), a full-width band
+  realigns everything under it (a spanning heading is placed below the deepest column and
+  every column restarts beneath it), and nothing is dropped or re-measured (each block
+  keeps its `x`, column, font and required height — only `y` and the sheet change, using
+  the same `blockPrintHeight` reflow measures). A block genuinely taller than a whole
+  sheet is still laid at the top of a fresh sheet and reported through the existing
+  `EXPORT_LAYOUT_CLIPPED` path, the one case where clipping is unavoidable.
+
+  `reflowBlocks` is unchanged, so the raster/image exports (whose promise is source
+  geometry) and the editor canvas keep their current push-down behaviour with no
+  regression. Growing the **editor preview** to show the continuation sheets, and growth
+  for the opt-in raster/image exports, are the next increment — the editor pane draws the
+  fixed-size page background behind the text, so a text-only continuation pane is a UI
+  change rather than a wiring change.
+
+### Changed
+
+- **`absolutePage` emits one `<section class="page">` per sheet** rather than exactly one
+  per source page. Sheet 0 keeps the background art and the stable `#page-N` anchor that
+  internal links jump to; a continuation sheet is `#page-N-M` with no artwork. `reflow`'s
+  edge-clamp report now fires only for a block taller than a whole sheet, since an
+  ordinary overflow grows a page instead.
+
 **Colour/export follow-up round** — the exported HTML and the editor showed wrong text
 colours (much of the text rendered white-on-white and looked invisible), and the export
 painted red dashed boxes around overflowing blocks.

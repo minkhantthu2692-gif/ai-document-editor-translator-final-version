@@ -21,7 +21,7 @@ import { textMeasurer, type TextMeasurer } from '@/editor/autofit'
 import { directionOf } from '@/lib/text'
 import type { LinkRef } from '@/pdf/links'
 import { highlightHtml, tokenCssRules } from './highlight'
-import { reflowBlocks } from './reflow'
+import { paginateBlocks } from './pagination'
 import {
   applyLinks,
   CODE_FONT_STACK,
@@ -287,26 +287,38 @@ function absolutePage(
   image?: string,
   onOverlap?: (blockId: string) => void,
 ): string {
-  const blocks = reflowBlocks(pageBlocks(page), {
+  // A longer translation grows the page rather than clamping at the bottom
+  // edge: one source page can print as several sheets of the same size, so an
+  // 8-page original may legitimately translate into 10. Sheet 0 is the
+  // original page and carries the background art and the stable `#page-N`
+  // anchor; a continuation sheet is a fresh page of text.
+  const sheets = paginateBlocks(pageBlocks(page), {
     measure,
     pageHeight: page.height,
     // Marker included: a bullet that pushes the first word onto a second line
     // has to be counted by the layout too.
     textOf: (block) => printedLine(block, options),
-    onOverlap: onOverlap ? (block) => onOverlap(block.id) : undefined,
+    onOverflow: onOverlap ? (block) => onOverlap(block.id) : undefined,
   })
-    .map((block) => blockHtml(block, options, ['block']))
-    .filter(Boolean)
+
+  return sheets
+    .map((sheet, sheetIndex) => {
+      const blocks = sheet
+        .map((block) => blockHtml(block, options, ['block']))
+        .filter(Boolean)
+        .join('\n')
+      const background =
+        sheetIndex === 0 && image ? `<img class="page-bg" alt="" src="${image}">` : ''
+      const id =
+        sheetIndex === 0 ? `page-${page.index + 1}` : `page-${page.index + 1}-${sheetIndex}`
+      return (
+        `<section class="page ${pageName(page.width, page.height)}" id="${id}"` +
+        ` data-page="${page.index}" data-sheet="${sheetIndex}"` +
+        ` style="width:${pt(page.width)};height:${pt(page.height)}">\n` +
+        `${background}\n${blocks}\n</section>`
+      )
+    })
     .join('\n')
-
-  const background = image ? `<img class="page-bg" alt="" src="${image}">` : ''
-
-  return (
-    `<section class="page ${pageName(page.width, page.height)}" id="page-${page.index + 1}"` +
-    ` data-page="${page.index}"` +
-    ` style="width:${pt(page.width)};height:${pt(page.height)}">\n` +
-    `${background}\n${blocks}\n</section>`
-  )
 }
 
 function flowPage(page: ExportDocument['pages'][number], options: HtmlOptions): string {
