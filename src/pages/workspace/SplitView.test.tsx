@@ -254,6 +254,50 @@ describe('SplitView', () => {
     expect(rows[1].querySelector(`[data-block-id="${second.id}"]`)).not.toBeNull()
   })
 
+  it('flows a block past the page edge onto a blank continuation sheet', async () => {
+    const [page] = await seedPages(1)
+    // A fills most of the 792pt page (its box dominates any measurement); B
+    // sits at its foot with a box that runs past the bottom edge, so B flows
+    // onto a second sheet instead of clamping on top of A.
+    const a = await seedBlock(page, {
+      order: 0,
+      x: 72,
+      y: 72,
+      width: 468,
+      height: 600,
+      fontSize: 12,
+      lineHeight: 1.6,
+    })
+    const b = await seedBlock(page, {
+      order: 1,
+      x: 72,
+      y: 760,
+      width: 468,
+      height: 60,
+      fontSize: 12,
+      lineHeight: 1.6,
+    })
+    renderView({ pages: [page], blocks: [a, b] })
+
+    // Sheet 0 keeps block A over its artwork; B lands on a continuation sheet.
+    expect(
+      screen.getByTestId('pane-translated').querySelector(`[data-block-id="${a.id}"]`),
+    ).not.toBeNull()
+    const continuation = screen.getByTestId('pane-translated-sheet1')
+    expect(continuation.querySelector(`[data-block-id="${b.id}"]`)).not.toBeNull()
+    // A continuation sheet is blank paper: no page artwork behind the text.
+    expect(continuation.querySelector('img')).toBeNull()
+    expect(continuation.querySelector('.skeleton-shimmer')).toBeNull()
+  })
+
+  it('renders exactly one sheet for a page whose text still fits', async () => {
+    const [page] = await seedPages(1)
+    const block = await seedBlock(page)
+    renderView({ pages: [page], blocks: [block] })
+    expect(screen.getByTestId('pane-translated')).toBeInTheDocument()
+    expect(screen.queryByTestId('pane-translated-sheet1')).toBeNull()
+  })
+
   it('routes a block click to selection and an empty-pane click to clearing it', async () => {
     const [page] = await seedPages(1)
     const block = await seedBlock(page)

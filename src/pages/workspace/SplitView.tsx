@@ -16,7 +16,7 @@ import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { useTranslation } from 'react-i18next'
 import type { PageRecord } from '@/db/types'
 import type { IndexedBlock } from '@/editor/commands'
-import { reflowForPage } from '@/editor/layout'
+import { paginateForPage } from '@/editor/layout'
 import type { EditorView } from '@/editor/types'
 import { storedEraseBoxes, type BBox } from '@/pdf/pageRender'
 import { BlockLayer, type BlockHighlight } from './BlockLayer'
@@ -61,11 +61,17 @@ interface PaneProps {
   badge?: string
   /** Stored boxes to erase from a `background` render (scanned/OCR pages). */
   eraseBoxes?: readonly BBox[]
+  /**
+   * A continuation sheet a grown page flowed onto: same size, but no page
+   * artwork — the original image belongs to the source sheet only, and a blank
+   * sheet is just white paper under the text.
+   */
+  blank?: boolean
   children?: ReactNode
 }
 
-function Pane({ fileId, page, zoom, mode, testId, badge, eraseBoxes, children }: PaneProps) {
-  const url = usePageUrl(fileId, page.index, mode, eraseBoxes)
+function Pane({ fileId, page, zoom, mode, testId, badge, eraseBoxes, blank, children }: PaneProps) {
+  const url = usePageUrl(blank ? null : fileId, page.index, mode, eraseBoxes)
   const widthPt = Math.max(1, page.width)
   const heightPt = Math.max(1, page.height)
 
@@ -80,7 +86,7 @@ function Pane({ fileId, page, zoom, mode, testId, badge, eraseBoxes, children }:
         className="absolute left-0 top-0 origin-top-left"
         style={{ width: `${widthPt}pt`, height: `${heightPt}pt`, transform: `scale(${zoom})` }}
       >
-        {url ? (
+        {blank ? null : url ? (
           <img src={url} alt="" decoding="async" className="absolute inset-0 h-full w-full" />
         ) : (
           <div className="skeleton-shimmer absolute inset-0" aria-hidden="true" />
@@ -107,9 +113,10 @@ function PageRow({ page, blocks, fileId, view, zoom, ...rest }: PageRowProps) {
   const showOriginal = view !== 'translated'
   const showTranslated = view !== 'original'
   // Draw the layout the export will produce, not the one the PDF was cut for:
-  // a block whose translation outgrew its box moves the blocks below it down
-  // here exactly as it will on the printed page.
-  const laidOut = useMemo(() => reflowForPage(blocks, page.height), [blocks, page.height])
+  // a block whose translation outgrew its box moves the blocks below it down,
+  // and one that ran past the page edge flows onto a continuation sheet below
+  // — here exactly as it will on the printed page.
+  const sheets = useMemo(() => paginateForPage(blocks, page.height), [blocks, page.height])
   // Scanned/OCR pages: without this geometry the pane artwork keeps the
   // original text and the overlay doubles it (C-02). Same fix, same policy as
   // the export background — the pane shows what will print.
@@ -140,34 +147,40 @@ function PageRow({ page, blocks, fileId, view, zoom, ...rest }: PageRowProps) {
           />
         ) : null}
         {showTranslated ? (
-          <Pane
-            fileId={fileId}
-            page={page}
-            zoom={zoom}
-            mode="background"
-            testId="pane-translated"
-            badge={t('editor.translatedPane')}
-            eraseBoxes={eraseBoxes}
-          >
-            <div
-              className="absolute inset-0"
-              onClick={(event) => {
-                if (event.target === event.currentTarget) rest.onClearSelection()
-              }}
-            >
-              <BlockLayer
-                blocks={laidOut}
-                selected={rest.selected}
-                editingId={rest.editingId}
-                overflowIds={rest.overflowIds}
-                {...(rest.matches ? { matches: rest.matches } : {})}
-                onSelect={rest.onSelect}
-                onBeginEdit={rest.onBeginEdit}
-                onCommitEdit={rest.onCommitEdit}
-                onCancelEdit={rest.onCancelEdit}
-              />
-            </div>
-          </Pane>
+          <div className="flex flex-col gap-2" data-testid="translated-sheets">
+            {sheets.map((sheetBlocks, sheetIndex) => (
+              <Pane
+                key={sheetIndex}
+                fileId={fileId}
+                page={page}
+                zoom={zoom}
+                mode="background"
+                testId={sheetIndex === 0 ? 'pane-translated' : `pane-translated-sheet${sheetIndex}`}
+                badge={sheetIndex === 0 ? t('editor.translatedPane') : undefined}
+                eraseBoxes={sheetIndex === 0 ? eraseBoxes : undefined}
+                blank={sheetIndex > 0}
+              >
+                <div
+                  className="absolute inset-0"
+                  onClick={(event) => {
+                    if (event.target === event.currentTarget) rest.onClearSelection()
+                  }}
+                >
+                  <BlockLayer
+                    blocks={sheetBlocks}
+                    selected={rest.selected}
+                    editingId={rest.editingId}
+                    overflowIds={rest.overflowIds}
+                    {...(rest.matches ? { matches: rest.matches } : {})}
+                    onSelect={rest.onSelect}
+                    onBeginEdit={rest.onBeginEdit}
+                    onCommitEdit={rest.onCommitEdit}
+                    onCancelEdit={rest.onCancelEdit}
+                  />
+                </div>
+              </Pane>
+            ))}
+          </div>
         ) : null}
       </div>
     </div>

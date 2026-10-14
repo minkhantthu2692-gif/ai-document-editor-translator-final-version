@@ -32,6 +32,7 @@
  */
 
 import { reflowBlocks } from '@/export/reflow'
+import { paginateBlocks } from '@/export/pagination'
 import { SETTING_KEYS, settingsRepo } from '@/db/repo-settings'
 import type { BlockRecord } from '@/db/types'
 import { fitBlockText, measureBlock, textMeasurer, type TextMeasurer } from './autofit'
@@ -133,6 +134,32 @@ export function reflowForPage(
     pageHeight,
     // Exactly what BlockLayer renders — no list-marker prefix, because the
     // canvas does not put one back either.
+    textOf: (block) => (block.translatedText.length > 0 ? block.translatedText : block.sourceText),
+  })
+}
+
+/**
+ * Where the editor should draw one page's blocks as one or more **sheets**,
+ * once the ones that outgrew their box have moved the rest down and any block
+ * that ran past the page edge has flowed onto a continuation sheet.
+ *
+ * The same `paginateBlocks` the export uses, on the same measurer and the same
+ * printed text, so the canvas cannot look broken here and clean in the file it
+ * prints to. Sheet 0 is the original page (a page whose text still fits comes
+ * back as exactly one sheet); a continuation sheet holds only the blocks that
+ * outgrew it, re-based to that sheet's own origin. `BlockLayer` positions by
+ * `block.x`/`block.y`, so each sheet renders its subset at its re-based spots.
+ */
+export function paginateForPage(
+  blocks: IndexedBlock[],
+  pageHeight: number,
+  measure: TextMeasurer = textMeasurer(),
+): IndexedBlock[][] {
+  if (blocks.length === 0) return [blocks]
+  return paginateBlocks(blocks, {
+    measure,
+    pageHeight,
+    // Exactly what BlockLayer renders — no list-marker prefix.
     textOf: (block) => (block.translatedText.length > 0 ? block.translatedText : block.sourceText),
   })
 }

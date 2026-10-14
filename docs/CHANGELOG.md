@@ -33,11 +33,18 @@ into 10).
   `EXPORT_LAYOUT_CLIPPED` path, the one case where clipping is unavoidable.
 
   `reflowBlocks` is unchanged, so the raster/image exports (whose promise is source
-  geometry) and the editor canvas keep their current push-down behaviour with no
-  regression. Growing the **editor preview** to show the continuation sheets, and growth
-  for the opt-in raster/image exports, are the next increment — the editor pane draws the
-  fixed-size page background behind the text, so a text-only continuation pane is a UI
-  change rather than a wiring change.
+  geometry) keep their current push-down behaviour with no regression. Growth for the
+  opt-in raster/image exports is the remaining increment.
+
+- **The editor preview grows the same pages the export does** (`src/editor/layout.ts`,
+  `src/pages/workspace/SplitView.tsx`): `paginateForPage` runs the same `paginateBlocks`
+  on the same measurer and printed text, so the canvas cannot look broken here and clean in
+  the file it prints to. `SplitView` draws sheet 0 in the real page pane (background art,
+  badge, erase boxes) and any continuation sheets as **blank** same-size panes stacked
+  below it — white paper under the text, no artwork — each carrying the blocks that flowed
+  onto it. `BlockLayer` already positions by `block.x`/`block.y`, so each sheet renders its
+  subset at its re-based spots. A page whose text still fits renders exactly one pane, as
+  before.
 
 ### Changed
 

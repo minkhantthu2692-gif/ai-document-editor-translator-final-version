@@ -828,14 +828,21 @@ nothing overflows, each overflowing block starting a fresh sheet at the top inst
 clamping. Columns flow independently; a full-width band realigns everything under it; only
 `y` and the sheet change (same `blockPrintHeight` reflow measures). This covers the screen
 `.html` export *and* print-to-PDF, both via `absolutePage`. `reflowBlocks` is untouched, so
-raster/image exports (source-geometry promise) and the editor canvas keep their push-down
-behaviour with no regression; growing the editor preview (a text-only continuation pane
-behind the fixed-size page image) and raster growth are the next increment. Coverage: new
-`src/export/pagination.test.ts` (13 cases — identity, single/multi-sheet growth, independent
-columns, spanning-band realignment + growth, taller-than-sheet overflow report, all-wide
-single column) and an updated `html.test.ts` (overflow grows a second `<section class="page">`
-and is no longer clipped; a taller-than-sheet block still is). Final gates: `typecheck` ✅,
-`lint` ✅, full suite ✅ 1668 passed / 6 skipped (113 files; +14 tests), `npm run build` ✅,
+raster/image exports (source-geometry promise) keep their push-down behaviour with no
+regression. Growing the **editor preview** to show the continuation sheets is the same
+`paginateBlocks` reached through a new `paginateForPage` (`src/editor/layout.ts`); `SplitView`
+(`src/pages/workspace/SplitView.tsx`) draws sheet 0 in the real page pane (artwork, badge,
+erase boxes) and each continuation as a **blank** same-size pane below it, each carrying the
+blocks that flowed onto it — `BlockLayer` already positions by `block.x`/`block.y`, so a page
+whose text fits still renders exactly one pane. Growth for the opt-in raster/image exports is
+the remaining increment. Coverage: new `src/export/pagination.test.ts` (13 cases — identity,
+single/multi-sheet growth, independent columns, spanning-band realignment + growth,
+taller-than-sheet overflow report, all-wide single column), an updated `html.test.ts` (overflow
+grows a second `<section class="page">` and is no longer clipped; a taller-than-sheet block
+still is), `paginateForPage` cases in `layout.test.ts`, and two `SplitView` cases (a block past
+the page edge flows onto a blank continuation sheet; a fitting page renders one pane). Final
+gates: `typecheck` ✅, `lint` ✅, full suite ✅ 1673 passed / 6 skipped (113 files; +19 tests
+across the export and editor increments), `npm run build` ✅,
 `node scripts/validate-export.mjs` ✅ 7 fixtures `errors=none` (incl. the 1502-block
 `text-300p` through the print path). Live-provider items (U-01/U-05) and the OFL note
 remain blocked as before.

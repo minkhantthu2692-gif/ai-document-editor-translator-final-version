@@ -3,7 +3,13 @@ import { describe, expect, it } from 'vitest'
 import { SETTING_KEYS, settingsRepo } from '@/db/repo-settings'
 import type { TextMeasurer } from './autofit'
 import type { IndexedBlock } from './commands'
-import { autoFitEnabled, reflowForPage, translationLayoutPatch, type LayoutBlock } from './layout'
+import {
+  autoFitEnabled,
+  paginateForPage,
+  reflowForPage,
+  translationLayoutPatch,
+  type LayoutBlock,
+} from './layout'
 
 /** ~0.5 em average advance — deterministic, no canvas needed. */
 const measure: TextMeasurer = ({ text, fontSize }) => text.length * fontSize * 0.5
@@ -208,5 +214,38 @@ describe('reflowForPage', () => {
 
   it('has nothing to lay out on an empty page', () => {
     expect(reflowForPage([], 792, measure)).toEqual([])
+  })
+})
+
+describe('paginateForPage', () => {
+  it('returns one sheet, and the same objects, when the page still fits', () => {
+    const a = indexed({ id: 'a' })
+    const b = indexed({ id: 'b', y: 95, order: 1 })
+    const sheets = paginateForPage([a, b], 792, measure)
+    expect(sheets).toHaveLength(1)
+    expect(sheets[0][0]).toBe(a)
+    expect(sheets[0][1]).toBe(b)
+  })
+
+  it('flows an overflowing block onto a second sheet, re-based to its top', () => {
+    // 20 words are two lines at 12pt/1.6 — 38.4pt; near a 200pt edge the
+    // second block runs past it and moves to a fresh sheet instead of clamping.
+    const sheets = paginateForPage(
+      [
+        indexed({ id: 'a', translatedText: words(15) }),
+        indexed({ id: 'b', y: 170, order: 1, translatedText: words(20) }),
+      ],
+      200,
+      measure,
+    )
+    expect(sheets).toHaveLength(2)
+    expect(sheets[0].map((block) => block.id)).toEqual(['a'])
+    expect(sheets[1].map((block) => block.id)).toEqual(['b'])
+    expect(sheets[1][0].y).toBe(72) // top of the continuation sheet
+    expect(sheets[1][0].x).toBe(72) // keeps its column
+  })
+
+  it('renders one empty sheet for a page with no blocks', () => {
+    expect(paginateForPage([], 792, measure)).toEqual([[]])
   })
 })
